@@ -1,0 +1,31 @@
+services:
+  pixtral-vllm:
+    image: nvcr.io/nvidia/tritonserver:25.04-vllm-python-py3
+    container_name: pixtral-vllm-server
+    runtime: nvidia
+    environment:
+      - CUDA_DEVICE_ORDER=PCI_BUS_ID
+      - NVIDIA_VISIBLE_DEVICES=0
+      - MODEL_PATH=/app/model
+      - MAX_MODEL_LEN=8192
+      - GPU_MEMORY_UTILIZATION=0.9
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+      # Quantization can be set here if needed, otherwise uses default in server
+      # - QUANTIZATION=bitsandbytes
+    ports:
+      - "30007:8000"
+    volumes:
+      - ./outputs_qwen/merged_model:/app/model:ro
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    command: ["python3", "-m", "vllm.entrypoints.openai.api_server", "--model", "/app/model", "--host", "0.0.0.0", "--port", "8000", "--trust-remote-code", "--disable-async-output-proc", "--max-model-len", "18000", "--gpu-memory-utilization", "0.85"]
+    shm_size: '32gb'
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]

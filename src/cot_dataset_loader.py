@@ -88,14 +88,16 @@ class OCRCoTDataset(Dataset):
                 with open(ocr_path, 'r', encoding='utf-8') as f:
                     ocr_text = f.read().strip()
             
+            # Add only CoT version
             examples.append({
-                "id": stem,
+                "id": f"{stem}_cot",
                 "image_path": str(image_path),
                 "prompt": prompt,
                 "cot_text": cot_text,
                 "output": output,
                 "ocr_text": ocr_text,
-                "format": output_format
+                "format": output_format,
+                "has_cot": True
             })
         
         return examples
@@ -104,17 +106,16 @@ class OCRCoTDataset(Dataset):
         return len(self.examples)
     
     def __getitem__(self, idx):
-        """Get a single example with randomly added 'think' and formatted CoT output."""
+        """Get a single example, with or without CoT based on has_cot flag."""
         example = self.examples[idx]
         
         # Read and prepare image
         image = Image.open(example["image_path"]).convert("RGB")
         
-        # Randomly add "think" to prompt
+        # All examples now have CoT
+        # WITH CoT: add "think" and format with <thk> tags
         prompt = self._add_think_to_prompt(example["prompt"], idx)
-        
-        # Format output with CoT in <thk> tags
-        cot_output = f"<thk>\n{example['cot_text']}\n</thk>\n{example['output']}"
+        output = f"<thk>\n{example['cot_text']}\n</thk>\n{example['output']}"
         
         # Format the full prompt with OCR if available
         if example.get("ocr_text", ""):
@@ -134,7 +135,7 @@ class OCRCoTDataset(Dataset):
             {
                 "role": "assistant",
                 "content": [
-                    {"type": "text", "text": cot_output}
+                    {"type": "text", "text": output}
                 ]
             }
         ]

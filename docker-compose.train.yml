@@ -1,0 +1,58 @@
+version: "3.9"
+
+services:
+  pixtral-train:
+    # Image is built from Dockerfile.train (build separately via `docker build -t fine-pixtral-train -f Dockerfile.train .`)
+    image: fine-pixtral-train
+    container_name: qwen-train
+
+    # Enable GPU access (NVIDIA Container Runtime)
+    runtime: nvidia
+
+    # TODO: Fix user permissions properly
+    # user: "${UID:-1000}:${GID:-1000}"
+    working_dir: /app
+
+    environment:
+      - CUDA_DEVICE_ORDER=PCI_BUS_ID
+      - NVIDIA_VISIBLE_DEVICES=0
+      # Optional: avoid CUDA OOM by allowing expandable segments
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+      # MinIO/S3 credentials for MLflow artifacts
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - MLFLOW_S3_ENDPOINT_URL=${MLFLOW_S3_ENDPOINT_URL}
+
+    # Use host networking as in the original `docker run` command
+    network_mode: "host"
+
+    # Mount source code, datasets, outputs and HF cache into the container
+    volumes:
+      - ./src:/app/src
+      - ./data-cot:/app/data-cot  # Keep legacy for backward compatibility
+      - ./datasetv2:/app/datasetv2  # New unified dataset
+      - ./test_data_200:/app/test_data_200  # Visual reasoning dataset images
+      - ./cot:/app/cot  # New CoT dataset images
+      - ./outputs-synth:/app/outputs-synth
+      - ./outputs_qwen:/app/outputs_qwen
+      - ~/.cache/huggingface:/root/.cache/huggingface
+
+    # Increase shared memory for larger batch sizes (same as inference compose)
+    shm_size: "32gb"
+
+    # Relax ulimits to avoid issues with deep learning workloads
+    ulimits:
+      memlock: -1
+      stack: 67108864
+
+    # Reserve the GPU device explicitly (Compose Swarm mode compatibility)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: ["gpu"]
+
+    # Default command starts the Qwen training script with Muon optimizer
+    command: ["python3", "-m", "src.train_qwen_muon", "--cot", "--output-dir=/app/outputs_qwen", "--muon-lr", "0.02", "--adamw-lr", "3e-4"]

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Fine-tune Pixtral for OCR structured output extraction.
+Fine-tune Qwen2.5-VL-7B for OCR structured output extraction.
 Following best practices from CLAUDE.md.
 """
 
@@ -20,8 +20,8 @@ from src.expanded_dataset_loader import ExpandedOCRDataset
 from src.cot_dataset_loader import OCRCoTDataset
 
 
-def setup_model(model_name: str = "unsloth/Pixtral-12B-2409", load_in_4bit: bool = True):
-    """Load and prepare Pixtral model with LoRA."""
+def setup_model(model_name: str = "unsloth/Qwen2.5-VL-7B-Instruct", load_in_4bit: bool = True):
+    """Load and prepare Qwen2.5-VL model with LoRA."""
     print(f"Loading model: {model_name}")
 
     model, tokenizer = FastVisionModel.from_pretrained(
@@ -36,11 +36,11 @@ def setup_model(model_name: str = "unsloth/Pixtral-12B-2409", load_in_4bit: bool
         # Fine-tune both vision and language layers for OCR task
         finetune_vision_layers=True,
         finetune_language_layers=True,
-        finetune_attention_modules=False,  # Save memory
+        finetune_attention_modules=False,
         finetune_mlp_modules=True,
 
-        r=16,  # Rank - higher for more complex tasks
-        lora_alpha=16,  # Usually same as r
+        r=64,  # Rank - higher for more complex tasks
+        lora_alpha=64,  # Usually same as r
         lora_dropout=0.05,  # Small dropout for regularization
         bias="none",
         random_state=3407,
@@ -52,8 +52,8 @@ def setup_model(model_name: str = "unsloth/Pixtral-12B-2409", load_in_4bit: bool
 
 
 @click.command()
-@click.option("--model", default="unsloth/Pixtral-12B-2409", help="Model to fine-tune")
-@click.option("--output-dir", type=click.Path(path_type=Path), default=Path("outputs"), help="Output directory")
+@click.option("--model", default="unsloth/Qwen2.5-VL-7B-Instruct", help="Model to fine-tune")
+@click.option("--output-dir", type=click.Path(path_type=Path), default=Path("outputs_qwen"), help="Output directory")
 @click.option("--cot", is_flag=True, help="Use CoT dataset for training")
 @click.option("--batch-size", type=int, default=1, help="Batch size per device")
 @click.option("--gradient-accumulation", type=int, default=8, help="Gradient accumulation steps")
@@ -68,17 +68,18 @@ def setup_model(model_name: str = "unsloth/Pixtral-12B-2409", load_in_4bit: bool
 @click.option("--patience", type=int, default=3, help="Early stopping patience (number of evals without improvement)")
 @click.option("--seed", type=int, default=3407, help="Random seed")
 @click.option("--no-4bit", is_flag=True, help="Disable 4bit quantization")
+@click.option("--resume-from-checkpoint", type=click.Path(exists=True, path_type=Path), default=None, help="Resume training from checkpoint")
 def main(model, output_dir, cot, batch_size, gradient_accumulation, learning_rate,
          num_epochs, max_steps, warmup_steps, logging_steps, save_steps,
-         val_ratio, eval_steps, patience, seed, no_4bit):
-    """Fine-tune Pixtral for OCR structured output extraction."""
+         val_ratio, eval_steps, patience, seed, no_4bit, resume_from_checkpoint):
+    """Fine-tune Qwen2.5-VL for OCR structured output extraction."""
 
     # Set up paths
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Set up MLflow
     mlflow.set_tracking_uri("http://localhost:5000")
-    mlflow.set_experiment("pixtral-ocr-20250724")
+    mlflow.set_experiment("qwen-ocr-20250729")
 
     # Load dataset
     if cot:
@@ -123,7 +124,7 @@ def main(model, output_dir, cot, batch_size, gradient_accumulation, learning_rat
         }
 
     # Create run name
-    run_name = f"Pixtral-OCR-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    run_name = f"Qwen-OCR-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 
     training_args = SFTConfig(
         per_device_train_batch_size=batch_size,
@@ -133,7 +134,7 @@ def main(model, output_dir, cot, batch_size, gradient_accumulation, learning_rat
         logging_steps=logging_steps,
         optim="paged_adamw_8bit",
         weight_decay=0.01,
-        lr_scheduler_type="cosine",  # Changed from linear to cosine
+        lr_scheduler_type="linear",  # Switched back from cosine to linear to disable cosine tapering
         seed=seed,
         output_dir=str(output_dir),
         report_to="mlflow",  # Enable MLflow logging

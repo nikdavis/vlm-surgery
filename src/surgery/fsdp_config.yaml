@@ -1,0 +1,21 @@
+compute_environment: LOCAL_MACHINE
+distributed_type: FSDP
+downcast_bf16: 'no'
+fsdp_config:
+  fsdp_activation_checkpointing: true
+  fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
+  fsdp_backward_prefetch: BACKWARD_PRE
+  fsdp_cpu_ram_efficient_loading: true
+  fsdp_forward_prefetch: false
+  fsdp_offload_params: false
+  fsdp_sharding_strategy: 1 # 1 for FULL_SHARD, 2 for SHARD_GRAD_OP
+  fsdp_state_dict_type: FULL_STATE_DICT
+  fsdp_sync_module_states: true
+  fsdp_transformer_layer_cls_to_wrap: Qwen3DecoderLayer # CRITICAL: This must match the LLM's block name
+  fsdp_use_orig_params: true
+machine_rank: 0
+main_training_function: main
+mixed_precision: 'bf16'
+num_machines: 1
+num_processes: 2 # The number of GPUs you want to use (2x 5090 + 2x 3090 = 4)
+use_cpu: false

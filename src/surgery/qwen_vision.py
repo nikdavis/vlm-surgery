@@ -1,0 +1,423 @@
+import torch
+import torch.nn as nn
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoModel
+from typing import Optional
+from pathlib import Path
+import json
+
+
+#   1. The Qwen2.5-VL visual model has a merger component that contains:
+#     - merger.mlp.0: Linear(5120 → 5120)
+#     - merger.mlp.1: GELU()
+#     - merger.mlp.2: Linear(5120 → 3584)
+
+class FinishedQwenR1Hybrid(nn.Module):
+    """
+    Finished-ish hybrid: Qwen2.5-VL vision + DeepSeek R1 language model.
+    - Uses a robust MLP adapter for dimension matching.
+    - Uses trainable start/end markers to bound vision embeddings.
+    - Includes save/load functionality.
+    """
+    def __init__(self,
+                 vision_model_name="Qwen/Qwen2.5-VL-7B-Instruct",
+                 language_model_name="deepseek-ai/DeepSeek-R1-0528-Qwen3-8B"):
+        super().__init__()
+
+        # --- 1. Load Original Models ---
+        print(f"Loading Qwen2.5-VL vision components from: {vision_model_name}")
+        # Import the specific Qwen2.5-VL model class
+        from transformers import Qwen2_5_VLForConditionalGeneration
+        print(f"About to load Qwen2_5_VLForConditionalGeneration from {vision_model_name}")
+        # Load without device_map first to avoid meta tensors
+        qwen_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            vision_model_name,
+            torch_dtype=torch.float16,
+        )
+        print(f"Successfully loaded model of type: {type(qwen_model)}")
+        # Access visual model directly from the model
+        self.vision_model = qwen_model.visual
+        # In Qwen2.5-VL, the vision model has the projection built-in
+        vision_hidden_size = qwen_model.config.vision_config.hidden_size
+        qwen_output_dim = qwen_model.config.vision_config.out_hidden_size
+        self.spatial_merge_size = qwen_model.config.vision_config.spatial_merge_size
+
+        print(f"\nLoading DeepSeek R1 from: {language_model_name}")
+        # Load without device_map to avoid meta tensors
+        self.language_model = AutoModelForCausalLM.from_pretrained(
+            language_model_name, torch_dtype=torch.float16
+        )
+        self.tokenizer = AutoTokenizer.from_pretrained(language_model_name)
+        r1_hidden_dim = self.language_model.config.hidden_size
+
+        # --- 2. Replace Qwen's merger projection to match R1's dimension ---
+        print(f"\nReplacing Qwen merger projection: {qwen_output_dim} -> {r1_hidden_dim}")
+        
+        # Create a stable adapter module
+        class StableAdapter(nn.Module):
+            def __init__(self, in_dim, out_dim):
+                super().__init__()
+                self.layer = nn.Linear(in_dim, out_dim, bias=True, dtype=torch.float16)
+                # Very small initialization
+                nn.init.normal_(self.layer.weight, mean=0.0, std=0.0002) 
+                nn.init.zeros_(self.layer.bias)
+                # Learnable scale to control output magnitude - start very small
+                self.scale = nn.Parameter(torch.tensor(0.01, dtype=torch.float16))
+                
+            def forward(self, x):
+                # Apply linear transformation with scaling
+                out = self.layer(x) * self.scale
+                return out
+        
+        # Replace the last layer with our stable adapter
+        self.vision_model.merger.mlp[2] = StableAdapter(5120, r1_hidden_dim)
+
+        # Create a config object that mimics a transformers config
+        class HybridConfig:
+            def __init__(self, **kwargs):
+                for k, v in kwargs.items():
+                    setattr(self, k, v)
+            
+            def to_dict(self):
+                return {k: v for k, v in self.__dict__.items() if not k.startswith('_')}
+        
+        # Get the actual vision token IDs from the tokenizer
+        vision_start_id = self.tokenizer.convert_tokens_to_ids("<|vision_start|>")
+        vision_end_id = self.tokenizer.convert_tokens_to_ids("<|vision_end|>")
+        image_pad_id = self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+        
+        print(f"\nVision tokens found in Qwen3 R1 tokenizer:")
+        print(f"  <|vision_start|>: {vision_start_id}")
+        print(f"  <|vision_end|>: {vision_end_id}")
+        print(f"  <|image_pad|>: {image_pad_id}")
+        
+        self.config = HybridConfig(
+            vision_model_name=vision_model_name,
+            language_model_name=language_model_name,
+            vision_placeholder_id=image_pad_id,  # Use the actual image_pad token
+            vision_start_token_id=vision_start_id,
+            vision_end_token_id=vision_end_id,
+            # Add some standard config attributes expected by Trainer
+            model_type="qwen_r1_hybrid",
+            architectures=["FinishedQwenR1Hybrid"],
+        )
+
+        base_embeds = self.language_model.get_input_embeddings()
+        # Register as parameters - ensure they require grad
+        self.vision_start_embedding = nn.Parameter(base_embeds.weight[self.config.vision_start_token_id].clone())
+        self.vision_end_embedding = nn.Parameter(base_embeds.weight[self.config.vision_end_token_id].clone())
+        self.vision_start_embedding.requires_grad = True
+        self.vision_end_embedding.requires_grad = True
+
+        del qwen_model
+        self._freeze_base_models()
+        
+        # Set the device attribute for Trainer compatibility
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # Print trainable parameters info
+        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in self.parameters())
+        print(f"\nTrainable parameters: {trainable_params:,} / {total_params:,} ({trainable_params/total_params*100:.2f}%)")
+        
+        # List what's trainable
+        print("\nTrainable components:")
+        for name, param in self.named_parameters():
+            if param.requires_grad:
+                print(f"  {name}: {param.shape}")
+
+    def get_input_embeddings(self):
+        """Get input embeddings from the language model."""
+        return self.language_model.get_input_embeddings()
+    
+    def set_input_embeddings(self, value):
+        """Set input embeddings for the language model."""
+        self.language_model.set_input_embeddings(value)
+
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        """Enable gradient checkpointing for the language model."""
+        if hasattr(self.language_model, 'gradient_checkpointing_enable'):
+            self.language_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs)
+        if hasattr(self.vision_model, 'gradient_checkpointing_enable'):
+            self.vision_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs)
+    
+    def gradient_checkpointing_disable(self):
+        """Disable gradient checkpointing for the language model."""
+        if hasattr(self.language_model, 'gradient_checkpointing_disable'):
+            self.language_model.gradient_checkpointing_disable()
+        if hasattr(self.vision_model, 'gradient_checkpointing_disable'):
+            self.vision_model.gradient_checkpointing_disable()
+
+    def _freeze_base_models(self):
+        """Freeze all components except the merger projection and markers."""
+        # Freeze ALL vision model parameters first
+        for param in self.vision_model.parameters():
+            param.requires_grad = False
+                
+        # Only unfreeze our custom adapter (the last layer we replaced)
+        if hasattr(self.vision_model.merger.mlp[2], 'parameters'):
+            for param in self.vision_model.merger.mlp[2].parameters():
+                param.requires_grad = True
+                
+        # Freeze language model completely
+        for param in self.language_model.parameters():
+            param.requires_grad = False
+
+        # Ensure markers are trainable
+        self.vision_start_embedding.requires_grad = True
+        self.vision_end_embedding.requires_grad = True
+
+    def get_trainable_parameters(self):
+        """Return all trainable parameters (merger + markers)."""
+        trainable_params = []
+        
+        # Get merger parameters
+        for name, param in self.vision_model.named_parameters():
+            if param.requires_grad:
+                trainable_params.append(param)
+                
+        # Add marker embeddings
+        trainable_params.extend([self.vision_start_embedding, self.vision_end_embedding])
+        
+        return trainable_params
+
+    def get_vision_embeddings(self, pixel_values: torch.Tensor, image_grid_thw: torch.Tensor) -> torch.Tensor:
+        """Process images through Qwen's vision pipeline."""
+        # Keep in float16 but add safety checks
+        pixel_values = pixel_values.to(dtype=torch.float16)
+        
+        # Normalize pixel values to prevent explosion
+        pixel_values = pixel_values / 255.0 if pixel_values.max() > 1.0 else pixel_values
+        
+        # The visual model expects grid_thw parameter
+        vision_features = self.vision_model(pixel_values, grid_thw=image_grid_thw)
+        
+        # Check for NaN/Inf in vision features
+        if torch.isnan(vision_features).any() or torch.isinf(vision_features).any():
+            print(f"WARNING: Vision features contain NaN/Inf!")
+            print(f"  Shape: {vision_features.shape}")
+            print(f"  Has NaN: {torch.isnan(vision_features).any().item()}")
+            print(f"  Has Inf: {torch.isinf(vision_features).any().item()}")
+            
+            # Emergency fallback - replace NaN with small random values
+            mask = torch.isnan(vision_features) | torch.isinf(vision_features)
+            vision_features = torch.where(
+                mask,
+                torch.randn_like(vision_features) * 0.02,
+                vision_features
+            )
+            
+        # vision_features shape: [total_patches, r1_hidden_dim] after our modified merger
+        return vision_features
+
+    def forward(self, input_ids: torch.Tensor, pixel_values: Optional[torch.Tensor] = None,
+                image_grid_thw: Optional[torch.Tensor] = None,
+                labels: Optional[torch.Tensor] = None, 
+                attention_mask: Optional[torch.Tensor] = None, **kwargs):
+
+        # Use get_input_embeddings to ensure we get the right embedding layer
+        text_embeddings = self.language_model.get_input_embeddings()(input_ids)
+        
+
+        # Debug gradient status - commented out now that it's working
+        # if not hasattr(self, '_forward_debug'):
+        #     self._forward_debug = True
+        #     print(f"\nDEBUG Forward Pass:")
+        #     print(f"  text_embeddings requires_grad: {text_embeddings.requires_grad}")
+        #     print(f"  text_embeddings shape: {text_embeddings.shape}")
+        #     print(f"  vision_start_embedding requires_grad: {self.vision_start_embedding.requires_grad}")
+        #     print(f"  vision_end_embedding requires_grad: {self.vision_end_embedding.requires_grad}")
+        #     print(f"  input_ids shape: {input_ids.shape}")
+        #     print(f"  Has pixel_values: {pixel_values is not None}")
+        #     if pixel_values is not None:
+        #         print(f"  pixel_values shape: {pixel_values.shape}")
+        #         print(f"  image_grid_thw shape: {image_grid_thw.shape}")
+
+        if pixel_values is None:
+            return self.language_model(inputs_embeds=text_embeddings, attention_mask=attention_mask, labels=labels, **kwargs)
+
+        # Get vision embeddings
+        vision_embeddings = self.get_vision_embeddings(pixel_values, image_grid_thw)
+        
+        # Split vision embeddings by image based on grid_thw
+        split_sizes = (image_grid_thw.prod(-1) // self.spatial_merge_size**2).tolist()
+        vision_embeds_list = torch.split(vision_embeddings, split_sizes)
+
+        new_input_embeds, new_labels, new_attention_mask = [], [], []
+        placeholder_mask = (input_ids == self.config.vision_placeholder_id)
+        
+        # More debug - commented out now that it's working
+        # if hasattr(self, '_forward_debug'):
+        #     print(f"\nDEBUG Placeholder Processing:")
+        #     print(f"  Vision placeholder id: {self.config.vision_placeholder_id}")
+        #     print(f"  Placeholder mask shape: {placeholder_mask.shape}")
+        #     print(f"  Placeholder mask sum: {placeholder_mask.sum().item()}")
+        #     print(f"  Batch size: {input_ids.shape[0]}")
+        #     # Check each sample
+        #     for i in range(min(2, input_ids.shape[0])):
+        #         sample_placeholders = placeholder_mask[i].sum().item()
+        #         print(f"  Sample {i}: {sample_placeholders} placeholders")
+        #         if sample_placeholders > 0:
+        #             # Show where placeholders are
+        #             indices = torch.where(placeholder_mask[i])[0]
+        #             print(f"    Placeholder indices: {indices.tolist()[:5]}...")  # First 5
+
+        for i in range(input_ids.shape[0]):
+            placeholder_indices = torch.where(placeholder_mask[i])[0]
+            if not len(placeholder_indices):
+                new_input_embeds.append(text_embeddings[i])
+                if labels is not None: new_labels.append(labels[i])
+                new_attention_mask.append(attention_mask[i])
+                continue
+
+            # For simplicity, assume one image per sample
+            marker_pos = placeholder_indices[0]
+            pre_marker_embeds = text_embeddings[i, :marker_pos]
+            post_marker_embeds = text_embeddings[i, marker_pos + 1:]
+            
+            # Get the vision embeddings for this sample
+            vision_embeds = vision_embeds_list[i]
+            
+            # Debug vision embedding - commented out now that it's working
+            # if i < 2 and hasattr(self, '_forward_debug'):
+            #     print(f"\n  Sample {i} vision insertion:")
+            #     print(f"    Vision embeds shape: {vision_embeds.shape}")
+            #     print(f"    Vision embeds requires_grad: {vision_embeds.requires_grad}")
+            #     print(f"    Marker position: {marker_pos}")
+            #     print(f"    Pre-marker length: {pre_marker_embeds.shape[0]}")
+            #     print(f"    Post-marker length: {post_marker_embeds.shape[0]}")
+
+            # Ensure vision embeddings are on the same device and dtype
+            vision_start = self.vision_start_embedding.unsqueeze(0).to(pre_marker_embeds.device, pre_marker_embeds.dtype)
+            vision_end = self.vision_end_embedding.unsqueeze(0).to(pre_marker_embeds.device, pre_marker_embeds.dtype)
+            vision_embeds = vision_embeds.to(pre_marker_embeds.device, pre_marker_embeds.dtype)
+            
+            # Check vision embedding scale before using
+            if hasattr(self, '_debug_loss_counter') and self._debug_loss_counter < 5:
+                v_max = vision_embeds.abs().max().item()
+                v_mean = vision_embeds.abs().mean().item()
+                t_max = pre_marker_embeds.abs().max().item() if pre_marker_embeds.shape[0] > 0 else 0
+                t_mean = pre_marker_embeds.abs().mean().item() if pre_marker_embeds.shape[0] > 0 else 0
+                print(f"    Vision embeds: max={v_max:.4f}, mean={v_mean:.4f}")
+                print(f"    Text embeds: max={t_max:.4f}, mean={t_mean:.4f}")
+            
+            # Don't scale for now - let's see raw values
+            # vision_embeds = vision_embeds * 0.5
+            
+            combined_embeds = torch.cat([
+                pre_marker_embeds, 
+                vision_start,
+                vision_embeds,
+                vision_end,
+                post_marker_embeds,
+            ], dim=0)
+            
+            
+            new_input_embeds.append(combined_embeds)
+
+            if labels is not None:
+                pre_marker_labels = labels[i, :marker_pos]
+                post_marker_labels = labels[i, marker_pos + 1:]
+                vision_part_len = 1 + vision_embeds.shape[0] + 1
+                vision_labels = torch.full((vision_part_len,), -100, device=labels.device, dtype=torch.long)
+                combined_labels = torch.cat([pre_marker_labels, vision_labels, post_marker_labels], dim=0)
+                new_labels.append(combined_labels)
+
+            pre_marker_mask = attention_mask[i, :marker_pos]
+            post_marker_mask = attention_mask[i, marker_pos + 1:]
+            vision_mask = torch.ones(1 + vision_embeds.shape[0] + 1, device=attention_mask.device, dtype=torch.long)
+            combined_mask = torch.cat([pre_marker_mask, vision_mask, post_marker_mask], dim=0)
+            new_attention_mask.append(combined_mask)
+
+        padded_embeds = torch.nn.utils.rnn.pad_sequence(new_input_embeds, batch_first=True, padding_value=0.0)
+        padded_mask = torch.nn.utils.rnn.pad_sequence(new_attention_mask, batch_first=True, padding_value=0)
+        padded_labels = torch.nn.utils.rnn.pad_sequence(new_labels, batch_first=True, padding_value=-100) if labels is not None else None
+        
+        # Final debug check - commented out now that it's working
+        # if hasattr(self, '_forward_debug'):
+        #     print(f"\nDEBUG Final tensors:")
+        #     print(f"  Padded embeds shape: {padded_embeds.shape}")
+        #     print(f"  Padded embeds requires_grad: {padded_embeds.requires_grad}")
+        #     print(f"  Number of samples with vision: {len(new_input_embeds)}")
+        #     # Check if any embedding requires grad
+        #     any_grad = any(e.requires_grad for e in new_input_embeds if isinstance(e, torch.Tensor))
+        #     print(f"  Any embedding requires grad: {any_grad}")
+        #     self._forward_debug = False  # Only print once
+
+
+        # Debug loss calculation
+        if hasattr(self, '_debug_loss_counter'):
+            self._debug_loss_counter += 1
+        else:
+            self._debug_loss_counter = 0
+            
+        if self._debug_loss_counter < 5 and padded_labels is not None:
+            # Check label distribution
+            non_masked = (padded_labels != -100).sum().item()
+            total = padded_labels.numel()
+            print(f"\nDEBUG Loss calculation (sample {self._debug_loss_counter}):")
+            print(f"  Labels shape: {padded_labels.shape}")
+            print(f"  Non-masked tokens: {non_masked}/{total} ({non_masked/total*100:.1f}%)")
+            print(f"  Padded embeds requires_grad: {padded_embeds.requires_grad}")
+            
+            # Check for NaN/Inf in embeddings
+            has_nan = torch.isnan(padded_embeds).any().item()
+            has_inf = torch.isinf(padded_embeds).any().item()
+            embed_max = padded_embeds.abs().max().item()
+            embed_mean = padded_embeds.abs().mean().item()
+            print(f"  Embeddings: has_nan={has_nan}, has_inf={has_inf}, max={embed_max:.4f}, mean={embed_mean:.4f}")
+            
+        output = self.language_model(
+            inputs_embeds=padded_embeds, attention_mask=padded_mask,
+            labels=padded_labels, **kwargs
+        )
+        
+        if self._debug_loss_counter < 5 and hasattr(output, 'loss'):
+            print(f"  Output loss: {output.loss.item() if output.loss is not None else 'None'}")
+            if output.loss is not None and torch.isnan(output.loss):
+                print(f"  WARNING: Loss is NaN!")
+                # Check logits
+                if hasattr(output, 'logits'):
+                    logits_max = output.logits.abs().max().item()
+                    logits_has_nan = torch.isnan(output.logits).any().item()
+                    logits_has_inf = torch.isinf(output.logits).any().item()
+                    print(f"  Logits: has_nan={logits_has_nan}, has_inf={logits_has_inf}, max={logits_max:.4f}")
+            
+        return output
+
+    def save_pretrained(self, save_directory: str):
+        path = Path(save_directory)
+        path.mkdir(parents=True, exist_ok=True)
+        with open(path / "adapter_config.json", "w") as f:
+            json.dump(self.config.to_dict(), f, indent=2)
+        # Save trainable state dict (merger + markers)
+        trainable_state_dict = {
+            'vision_merger_state': self.vision_model.merger.state_dict(),
+            'vision_start_embedding': self.vision_start_embedding,
+            'vision_end_embedding': self.vision_end_embedding,
+        }
+        torch.save(trainable_state_dict, path / "vision_adapter.pt")
+        self.tokenizer.save_pretrained(save_directory)
+        print(f"Finished hybrid model saved to {save_directory}")
+
+    @classmethod
+    def from_pretrained(cls, model_directory: str):
+        path = Path(model_directory)
+        with open(path / "adapter_config.json", "r") as f:
+            config = json.load(f)
+        model = cls(config.get('vision_model_name'), config.get('language_model_name'))
+        # Load saved weights
+        adapter_state = torch.load(path / "vision_adapter.pt")
+        model.vision_model.merger.load_state_dict(adapter_state['vision_merger_state'])
+        model.vision_start_embedding.data = adapter_state['vision_start_embedding'].data
+        model.vision_end_embedding.data = adapter_state['vision_end_embedding'].data
+        print(f"Loaded hybrid model from {model_directory}")
+        return model
+
+# --- Test ---
+if __name__ == "__main__":
+    model = FinishedQwenR1Hybrid()
+    trainable_params = sum(p.numel() for p in model.get_trainable_parameters())
+    print(f"\nTotal trainable parameters: {trainable_params:,}")
+    model.save_pretrained("./qwen_r1_finished_hybrid")
+    loaded_model = FinishedQwenR1Hybrid.from_pretrained("./qwen_r1_finished_hybrid")
+    print("\nModel saved and loaded successfully!")

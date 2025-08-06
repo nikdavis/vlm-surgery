@@ -1,0 +1,46 @@
+# Use the same base NVIDIA image for consistency with inference
+FROM nvcr.io/nvidia/tritonserver:25.04-vllm-python-py3
+
+# Set the working directory
+WORKDIR /app
+
+# Install system dependencies
+# git is required for installing unsloth from its repository
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends git && \
+    rm -rf /var/lib/apt/lists/*
+
+# Copy the project's dependency definition
+COPY pyproject.toml .
+
+
+RUN apt-get remove -y python3-blinker
+
+# Install Python dependencies for training
+# We cherry-pick the necessary libraries from pyproject.toml
+# The base image already has torch, torchvision, and transformers.
+# We install the specific versions and training-focused libraries.
+RUN pip install --no-cache-dir --break-system-packages \
+    # Core training libraries
+    "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git" \
+    "trl==0.19.1" \
+    "peft==0.16.0" \
+    "accelerate==1.9.0" \
+    "bitsandbytes==0.46.1" \
+    # Other dependencies
+    "datasets>=2.14.0" \
+    "pillow>=10.0.0" \
+    "click>=8.2.1" \
+    "mlflow>=3.1.4" \
+    "boto3>=1.26.0" \
+    "pydantic-xml>=2.17.3" \
+    "pydantic>=2.11.7" \
+    # Muon optimizer
+    "git+https://github.com/KellerJordan/Muon" \
+    "timm" \
+    "einops"
+
+
+# Default command to show the help message for the training script
+# This makes it easy to see available options when running the container
+CMD ["python3", "-m", "src/train_qwen.py", "--cot", "--output-dir=/app/outputs_qwen"]

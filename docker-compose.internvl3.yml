@@ -1,0 +1,26 @@
+services:
+  internvl3-vllm:
+    image: nvcr.io/nvidia/tritonserver:25.04-vllm-python-py3
+    container_name: internvl3-vllm-server
+    runtime: nvidia
+    environment:
+      - CUDA_DEVICE_ORDER=PCI_BUS_ID
+      - NVIDIA_VISIBLE_DEVICES=0,3
+      - HF_HOME=/root/.cache/huggingface
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    ports:
+      - "30008:8000"
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    command: ["python3", "-m", "vllm.entrypoints.openai.api_server", "--model", "OpenGVLab/InternVL3-38B-AWQ", "--host", "0.0.0.0", "--port", "8000", "--trust-remote-code", "--disable-async-output-proc", "--max-model-len", "16384", "--gpu-memory-utilization", "0.95", "--quantization", "awq", "--dtype", "auto", "--tensor-parallel-size", "2"]
+    shm_size: '32gb'
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0', '3']
+              capabilities: [gpu]
