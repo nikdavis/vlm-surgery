@@ -7,14 +7,56 @@ from pathlib import Path
 import torch
 from transformers import Trainer, TrainingArguments, AutoTokenizer, AutoProcessor
 from transformers.optimization import Adafactor, AdafactorSchedule
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import click
 from datetime import datetime
 import mlflow
+from loguru import logger
+import os
+import torch.utils.data
+
+# Configure loguru from environment
+log_level = os.getenv('LOGURU_LEVEL', 'INFO')
+logger.remove()
+logger.add(lambda msg: print(msg, end=""), level=log_level, format="{time:HH:mm:ss} | {level: <8} | {message}")
 
 # Import the Qwen-Qwen hybrid model and the existing dataset loader
 from src.surgery.qwen_qwen_vision import QwenQwenHybrid
 from src.unified_dataset_loader import UnifiedOCRDataset
+
+
+class AdapterOnlyTrainer(Trainer):
+    """Custom trainer that only saves the adapter weights, not the full model."""
+    
+    def _save(self, output_dir: Optional[str] = None, state_dict=None):
+        """Override save to only save adapter weights using the model's save_pretrained method."""
+        output_dir = output_dir if output_dir is not None else self.args.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        
+        logger.info(f"Saving adapter weights to {output_dir}")
+        
+        # Use the model's custom save_pretrained method which only saves adapter weights
+        if hasattr(self.model, 'save_pretrained'):
+            self.model.save_pretrained(output_dir)
+        else:
+            logger.error("Model doesn't have save_pretrained method!")
+            
+        # Save training state (optimizer, scheduler, etc.) separately
+        # This is important for resuming training
+        torch.save({
+            'epoch': self.state.epoch,
+            'global_step': self.state.global_step,
+            'best_metric': self.state.best_metric,
+            'best_model_checkpoint': self.state.best_model_checkpoint,
+        }, os.path.join(output_dir, 'trainer_state.pt'))
+        
+        # Save training args for reference
+        import json
+        with open(os.path.join(output_dir, 'training_args.json'), 'w') as f:
+            json.dump(self.args.to_dict(), f, indent=2)
+        
+        logger.info(f"Adapter checkpoint saved successfully")
+
 
 class CoTDataCollator:
     """
@@ -77,7 +119,7 @@ class CoTDataCollator:
             messages_for_processor,
             padding=False,  # We'll pad after inserting vision tokens
             truncation=True,
-            max_length=512,  # Further reduced to fit without gradient checkpointing
+            max_length=1024,  # Increased to ensure we capture assistant response
             return_tensors=None  # Get list format first
         )
         
@@ -112,7 +154,7 @@ class CoTDataCollator:
             
             if insert_pos is None:
                 # Fallback: just use as-is
-                print(f"WARNING: Could not find user prompt position in sample {i}")
+                logger.info(f"Could not find user prompt position in sample {i}")
                 modified_input_ids.append(torch.tensor(input_ids))
                 continue
             
@@ -124,10 +166,10 @@ class CoTDataCollator:
             if i < 2 and not hasattr(self, '_insertion_logged'):  # First 2 samples, first batch only
                 tokens_before = self.tokenizer.decode(input_ids[:insert_pos])
                 tokens_after = self.tokenizer.decode(input_ids[insert_pos:insert_pos+50])  # First 50 chars after
-                print(f"\nDEBUG Sample {i} insertion:")
-                print(f"  Inserting {num_images} image_pad tokens at position {insert_pos}")
-                print(f"  Text before: ...{tokens_before[-50:]}")
-                print(f"  Text after: {tokens_after}...")
+                logger.info(f"Sample {i} insertion:")
+                logger.info(f"  Inserting {num_images} image_pad tokens at position {insert_pos}")
+                logger.info(f"  Text before: ...{tokens_before[-50:]}")
+                logger.info(f"  Text after: {tokens_after}...")
             
             # Insert only the image_pad tokens
             new_ids = input_ids[:insert_pos] + image_pad_tokens + input_ids[insert_pos:]
@@ -146,23 +188,23 @@ class CoTDataCollator:
         # Debug: Check if vision tokens were inserted
         if not hasattr(self, '_debug_printed'):
             self._debug_printed = True
-            print(f"\nDEBUG Collator Summary:")
-            print(f"  Placeholder id (image_pad): {self.placeholder_id}")
-            print(f"  Vision start id: {vision_start_id}")
-            print(f"  Vision end id: {vision_end_id}")
-            print(f"  Total images processed: {image_idx}")
+            logger.info("Collator Summary:")
+            logger.info(f"  Placeholder id (image_pad): {self.placeholder_id}")
+            logger.info(f"  Vision start id: {vision_start_id}")
+            logger.info(f"  Vision end id: {vision_end_id}")
+            logger.info(f"  Total images processed: {image_idx}")
             for i in range(min(2, input_ids.shape[0])):  # Check first 2 samples
                 num_placeholders = (input_ids[i] == self.placeholder_id).sum().item()
                 num_vision_start = (input_ids[i] == vision_start_id).sum().item()
                 num_vision_end = (input_ids[i] == vision_end_id).sum().item()
-                print(f"  Sample {i}: {num_placeholders} image_pad, {num_vision_start} vision_start, {num_vision_end} vision_end")
+                logger.info(f"  Sample {i}: {num_placeholders} image_pad, {num_vision_start} vision_start, {num_vision_end} vision_end")
                 # Show actual token sequence around placeholders
                 if num_placeholders > 0:
                     placeholder_pos = (input_ids[i] == self.placeholder_id).nonzero(as_tuple=True)[0][0].item()
                     start = max(0, placeholder_pos - 5)
                     end = min(len(input_ids[i]), placeholder_pos + 5)
                     token_window = input_ids[i][start:end].tolist()
-                    print(f"    Token window around placeholder: {token_window}")
+                    logger.info(f"    Token window around placeholder: {token_window}")
             self._insertion_logged = True  # Mark that we've logged insertion
         
         # Process images
@@ -181,6 +223,16 @@ class CoTDataCollator:
             assistant_prompt = self.tokenizer.encode("<|im_start|>assistant\n", add_special_tokens=False)
             assistant_pos = None
             
+            # Debug: Log what we're looking for vs what we have (only for first few samples)
+            if i < 2 and not hasattr(self, '_assistant_debug_logged'):
+                logger.info(f"Sample {i} assistant token search:")
+                logger.info(f"  Looking for tokens: {assistant_prompt}")
+                logger.info(f"  First 20 tokens in sample: {input_id_list[:20]}")
+                # Decode to see actual text
+                sample_text = self.tokenizer.decode(input_id_list[:100])
+                logger.info(f"  First 100 chars decoded: {sample_text[:100]}")
+                self._assistant_debug_logged = True
+            
             if len(assistant_prompt) > 0:
                 # Find this sequence in the input
                 for j in range(len(input_id_list) - len(assistant_prompt) + 1):
@@ -188,15 +240,52 @@ class CoTDataCollator:
                         assistant_pos = j + len(assistant_prompt)
                         break
             
+            # Try alternative patterns if standard pattern not found
+            if assistant_pos is None:
+                # Try pattern 2: <｜Assistant｜> (DeepSeek R1 style)
+                assistant_token_id = 151670  # <｜Assistant｜> token
+                for j in range(len(input_id_list)):
+                    if input_id_list[j] == assistant_token_id:
+                        assistant_pos = j + 1  # Position after the assistant token
+                        if i < 2:
+                            logger.info(f"  Found assistant token 151670 at position {j}")
+                        break
+            
+            # Try pattern 3: Look for "assistant" in any form
+            if assistant_pos is None:
+                # Encode just "assistant" and look for it
+                assistant_variants = [
+                    self.tokenizer.encode("assistant", add_special_tokens=False),
+                    self.tokenizer.encode("Assistant", add_special_tokens=False),
+                    self.tokenizer.encode("\nassistant", add_special_tokens=False),
+                ]
+                for variant in assistant_variants:
+                    if len(variant) > 0:
+                        for j in range(len(input_id_list) - len(variant) + 1):
+                            if all(input_id_list[j + k] == variant[k] for k in range(len(variant))):
+                                assistant_pos = j + len(variant)
+                                if i < 2:
+                                    logger.info(f"  Found assistant variant at position {j}")
+                                break
+                        if assistant_pos is not None:
+                            break
+            
             if assistant_pos is not None:
                 # Mask everything before assistant response (user prompt and assistant marker)
                 labels[i, :assistant_pos] = -100
-                if i < 2:  # Debug first 2 samples
+                # Only log for first batch to reduce spam
+                if i < 2 and not hasattr(self, '_mask_logged'):
                     masked_count = assistant_pos
                     total_count = len(input_id_list)
-                    print(f"  Sample {i}: Masked {masked_count} tokens before assistant response")
+                    logger.info(f"  Sample {i}: Masked {masked_count} tokens before assistant response")
+                    self._mask_logged = True
             else:
-                print(f"Warning: Could not find assistant token in sample {i}")
+                # Only log occasionally to reduce spam
+                if not hasattr(self, '_assistant_not_found_count'):
+                    self._assistant_not_found_count = 0
+                self._assistant_not_found_count += 1
+                if self._assistant_not_found_count <= 3:  # Only log first 3 times
+                    logger.info(f"Could not find assistant token in sample {i}")
                 # As fallback, don't mask anything - at least we'll train on something
                 continue
 
@@ -206,17 +295,17 @@ class CoTDataCollator:
         # Debug: Check label masking
         if not hasattr(self, '_label_debug_printed'):
             self._label_debug_printed = True
-            print(f"\nDEBUG Label masking:")
+            logger.info("Label masking:")
             for i in range(min(2, labels.shape[0])):
                 non_masked = (labels[i] != -100).sum().item()
                 total = (labels[i] != self.tokenizer.pad_token_id).sum().item()  # Don't count padding
-                print(f"  Sample {i}: {non_masked}/{total} non-padded tokens are unmasked ({non_masked/total*100:.1f}% if total > 0 else 0)")
+                logger.info(f"  Sample {i}: {non_masked}/{total} non-padded tokens are unmasked ({non_masked/total*100:.1f}% if total > 0 else 0)")
                 # Show first few non-masked tokens
                 non_masked_indices = (labels[i] != -100).nonzero(as_tuple=True)[0]
                 if len(non_masked_indices) > 0:
                     first_tokens = labels[i][non_masked_indices[:10]].tolist()
                     decoded = [self.tokenizer.decode([t]) for t in first_tokens]
-                    print(f"    First non-masked tokens: {decoded}")
+                    logger.info(f"    First non-masked tokens: {decoded}")
 
         # Combine everything
         result = {
@@ -235,9 +324,9 @@ class CoTDataCollator:
 @click.option("--output-dir", default="./outputs_qwen_hybrid", help="Output directory for checkpoints.")
 @click.option("--data-path", default="./datasetv2/combined_dataset.json", help="Path to the unified dataset JSON file.")
 @click.option("--batch-size", type=int, default=1, help="Training batch size per device.")
-@click.option("--gradient-accumulation", type=int, default=16, help="Gradient accumulation steps.")
-@click.option("--learning-rate", type=float, default=5e-5, help="Learning rate for the adapter.")
-@click.option("--num-epochs", type=int, default=1, help="Number of training epochs.")
+@click.option("--gradient-accumulation", type=int, default=32, help="Gradient accumulation steps.")
+@click.option("--learning-rate", type=float, default=1e-5, help="Learning rate for the adapter.")
+@click.option("--num-epochs", type=int, default=3, help="Number of training epochs.")
 def main(output_dir, data_path, batch_size, gradient_accumulation, learning_rate, num_epochs):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -255,12 +344,18 @@ def main(output_dir, data_path, batch_size, gradient_accumulation, learning_rate
 
     # For Qwen3, we'll train without thinking tokens for stability
     # The model has native thinking support that can be enabled at inference
-    print("Training WITHOUT thinking tokens for stability")
-    print("Thinking can be enabled at inference with enable_thinking=True")
+    logger.info("Training WITHOUT thinking tokens for stability")
+    logger.info("Thinking can be enabled at inference with enable_thinking=True")
 
     # 2. Load the dataset without CoT (we'll strip thinking tokens)
     full_dataset = UnifiedOCRDataset(data_path, enable_cot=False)
     train_dataset, val_dataset = full_dataset.get_train_val_split(val_ratio=0.02)
+    
+    # Limit validation set size to avoid OOM during evaluation
+    # Take only first 10 samples for validation to keep memory usage low
+    if len(val_dataset) > 10:
+        logger.info(f"Limiting validation set from {len(val_dataset)} to 10 samples to avoid OOM")
+        val_dataset = torch.utils.data.Subset(val_dataset, range(10))
 
     # Create run name
     run_name = f"Qwen-Qwen-NoThinking-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
@@ -269,16 +364,19 @@ def main(output_dir, data_path, batch_size, gradient_accumulation, learning_rate
     training_args = TrainingArguments(
         output_dir=str(output_dir),
         per_device_train_batch_size=batch_size,
+        per_device_eval_batch_size=1,  # Keep eval batch size at 1 to avoid OOM
         gradient_accumulation_steps=gradient_accumulation,
+        eval_accumulation_steps=4,  # Process eval data in chunks of 4 to avoid OOM
         learning_rate=learning_rate,
         num_train_epochs=num_epochs,
-        bf16=False, # Disable for numerical stability
-        fp16=False, # Keep everything in fp32
+        bf16=True, # Use bfloat16 for memory efficiency
+        fp16=False, # BF16 is better than FP16 for stability
         logging_steps=5,
         save_strategy="steps",
-        save_steps=100,
+        save_steps=10,  # Save every 10 steps
+        save_safetensors=False,  # Disable safetensors to avoid shared tensor issues
         eval_strategy="steps",
-        eval_steps=100,
+        eval_steps=20,  # Evaluate every 20 steps
         do_train=True,
         do_eval=True,
         remove_unused_columns=False,
@@ -287,16 +385,19 @@ def main(output_dir, data_path, batch_size, gradient_accumulation, learning_rate
         optim="adafactor",  # Tell trainer we're using Adafactor
         report_to="mlflow",  # Enable MLflow logging
         run_name=run_name,
-        max_grad_norm=0.01,  # Very aggressive gradient clipping
-        warmup_steps=10,  # Fixed small warmup - just 10 steps instead of ratio
+        max_grad_norm=1.0,  # Standard gradient clipping
+        warmup_ratio=0.1,  # 10% warmup is more stable than fixed steps
+        dataloader_num_workers=0,  # Disable multiprocessing to save memory
+        eval_delay=20,  # Delay first evaluation to step 20
     )
 
     # The Trainer will handle gradient checkpointing based on training_args
     # Disable cache when using gradient checkpointing
     model.language_model.config.use_cache = False
 
-    # 4. Instantiate the Trainer (Adafactor will be used automatically)
-    trainer = Trainer(
+    # 4. Instantiate the custom AdapterOnlyTrainer (Adafactor will be used automatically)
+    # This custom trainer only saves adapter weights to avoid shared tensor issues
+    trainer = AdapterOnlyTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
@@ -305,7 +406,7 @@ def main(output_dir, data_path, batch_size, gradient_accumulation, learning_rate
     )
 
     # 5. Start training with MLflow tracking
-    print("\n--- Starting Training ---")
+    logger.info("Starting Training")
     with mlflow.start_run(run_name=run_name) as run:
         # Log initial parameters
         mlflow.log_params({
@@ -329,16 +430,16 @@ def main(output_dir, data_path, batch_size, gradient_accumulation, learning_rate
             "train_samples_per_second": trainer_stats.metrics.get('train_samples_per_second', 0),
         })
         
-        print("\n--- Training Complete ---")
+        logger.info("Training Complete")
     
         # 6. Save the final trained adapter
         model.save_pretrained(str(output_dir / "final_model"))
-        print(f"Final model adapter saved to {output_dir / 'final_model'}")
+        logger.info(f"Final model adapter saved to {output_dir / 'final_model'}")
         
         # Log the final model artifacts
         mlflow.log_artifacts(str(output_dir / "final_model"), "model")
     
-    print(f"MLflow tracking at: http://localhost:5000")
+    logger.info(f"MLflow tracking at: http://localhost:5000")
 
 if __name__ == "__main__":
     main()

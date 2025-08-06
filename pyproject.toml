@@ -29,6 +29,7 @@ dependencies = [
     "timm>=1.0.19",
     "einops>=0.8.1",
     "pytest>=8.4.1",
+    "loguru>=0.7.3",
 ]
 
 [tool.uv.sources]

@@ -4,6 +4,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, AutoModel
 from typing import Optional
 from pathlib import Path
 import json
+from loguru import logger
 
 
 #   1. The Qwen2.5-VL visual model has a merger component that contains:
@@ -24,16 +25,16 @@ class QwenQwenHybrid(nn.Module):
         super().__init__()
 
         # --- 1. Load Original Models ---
-        print(f"Loading Qwen2.5-VL vision components from: {vision_model_name}")
+        logger.info(f"Loading Qwen2.5-VL vision components from: {vision_model_name}")
         # Import the specific Qwen2.5-VL model class
         from transformers import Qwen2_5_VLForConditionalGeneration
-        print(f"About to load Qwen2_5_VLForConditionalGeneration from {vision_model_name}")
+        logger.debug(f"About to load Qwen2_5_VLForConditionalGeneration from {vision_model_name}")
         # Load without device_map first to avoid meta tensors
         qwen_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             vision_model_name,
             torch_dtype=torch.float16,
         )
-        print(f"Successfully loaded model of type: {type(qwen_model)}")
+        logger.info(f"Successfully loaded model of type: {type(qwen_model)}")
         # Access visual model directly from the model
         self.vision_model = qwen_model.visual
         # In Qwen2.5-VL, the vision model has the projection built-in
@@ -41,7 +42,7 @@ class QwenQwenHybrid(nn.Module):
         qwen_output_dim = qwen_model.config.vision_config.out_hidden_size
         self.spatial_merge_size = qwen_model.config.vision_config.spatial_merge_size
 
-        print(f"\nLoading Qwen3-4B from: {language_model_name}")
+        logger.info(f"Loading Qwen3-4B from: {language_model_name}")
         # Load without device_map to avoid meta tensors
         self.language_model = AutoModelForCausalLM.from_pretrained(
             language_model_name, torch_dtype=torch.float16
@@ -50,7 +51,7 @@ class QwenQwenHybrid(nn.Module):
         r1_hidden_dim = self.language_model.config.hidden_size
 
         # --- 2. Replace Qwen's merger projection to match Qwen3's dimension ---
-        print(f"\nReplacing Qwen merger projection: {qwen_output_dim} -> {r1_hidden_dim}")
+        logger.info(f"Replacing Qwen merger projection: {qwen_output_dim} -> {r1_hidden_dim}")
         
         # Store original layer 2 for backup
         original_layer2 = self.vision_model.merger.mlp[2]
@@ -61,7 +62,8 @@ class QwenQwenHybrid(nn.Module):
                 super().__init__()
                 # Use fp32 for stability
                 self.linear = nn.Linear(in_dim, out_dim, bias=True, dtype=torch.float32)
-                nn.init.normal_(self.linear.weight, mean=0.0, std=0.0001)
+                # Initialize with smaller std for stability
+                nn.init.normal_(self.linear.weight, mean=0.0, std=0.02)
                 nn.init.zeros_(self.linear.bias)
                 
             def forward(self, x):
@@ -101,10 +103,10 @@ class QwenQwenHybrid(nn.Module):
         vision_end_id = self.tokenizer.convert_tokens_to_ids("<|vision_end|>")
         image_pad_id = self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
         
-        print(f"\nVision tokens found in Qwen3 tokenizer:")
-        print(f"  <|vision_start|>: {vision_start_id}")
-        print(f"  <|vision_end|>: {vision_end_id}")
-        print(f"  <|image_pad|>: {image_pad_id}")
+        logger.info("Vision tokens found in Qwen3 tokenizer:")
+        logger.info(f"  <|vision_start|>: {vision_start_id}")
+        logger.info(f"  <|vision_end|>: {vision_end_id}")
+        logger.info(f"  <|image_pad|>: {image_pad_id}")
         
         self.config = HybridConfig(
             vision_model_name=vision_model_name,
@@ -134,16 +136,16 @@ class QwenQwenHybrid(nn.Module):
         # Set the device attribute for Trainer compatibility
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        # Print trainable parameters info
+        # Log trainable parameters info
         trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
         total_params = sum(p.numel() for p in self.parameters())
-        print(f"\nTrainable parameters: {trainable_params:,} / {total_params:,} ({trainable_params/total_params*100:.2f}%)")
+        logger.info(f"Trainable parameters: {trainable_params:,} / {total_params:,} ({trainable_params/total_params*100:.2f}%)")
         
         # List what's trainable
-        print("\nTrainable components:")
+        logger.info("Trainable components:")
         for name, param in self.named_parameters():
             if param.requires_grad:
-                print(f"  {name}: {param.shape}")
+                logger.debug(f"  {name}: {param.shape}")
 
     def get_input_embeddings(self):
         """Get input embeddings from the language model."""
@@ -176,13 +178,17 @@ class QwenQwenHybrid(nn.Module):
         return self
 
     def _freeze_base_models(self):
-        """Freeze all components except the replaced merger projection and markers."""
+        """Freeze all components except the entire merger MLP and markers."""
         # Freeze ALL vision model parameters first
         for param in self.vision_model.parameters():
             param.requires_grad = False
                 
-        # Then unfreeze ONLY the replaced projection layer
-        # This is critical - we must explicitly set these to True
+        # Then unfreeze the ENTIRE merger MLP (all 3 layers)
+        # Layer 0: Linear(5120 -> 5120)
+        self.vision_model.merger.mlp[0].weight.requires_grad = True
+        self.vision_model.merger.mlp[0].bias.requires_grad = True
+        # Layer 1 is GELU, no parameters
+        # Layer 2: Our replaced DtypeWrapper(5120 -> 2560)
         self.vision_model.merger.mlp[2].linear.weight.requires_grad = True
         self.vision_model.merger.mlp[2].linear.bias.requires_grad = True
                 
@@ -195,10 +201,13 @@ class QwenQwenHybrid(nn.Module):
         self.vision_end_embedding.requires_grad = True
 
     def get_trainable_parameters(self):
-        """Return all trainable parameters (merger projection + markers)."""
+        """Return all trainable parameters (entire merger MLP + markers)."""
         trainable_params = []
         
-        # Get the replaced merger projection parameters
+        # Get ALL merger MLP parameters
+        # Layer 0
+        trainable_params.extend([self.vision_model.merger.mlp[0].weight, self.vision_model.merger.mlp[0].bias])
+        # Layer 2 (our replaced layer)
         trainable_params.extend([self.vision_model.merger.mlp[2].linear.weight, self.vision_model.merger.mlp[2].linear.bias])
                 
         # Add marker embeddings
@@ -213,10 +222,10 @@ class QwenQwenHybrid(nn.Module):
             self._vision_debug_count = 0
         
         if self._vision_debug_count < 3:
-            print(f"\nDEBUG Vision Input {self._vision_debug_count}:")
-            print(f"  pixel_values: shape={pixel_values.shape}, dtype={pixel_values.dtype}")
-            print(f"  pixel min/max: {pixel_values.min().item():.4f} / {pixel_values.max().item():.4f}")
-            print(f"  has NaN: {torch.isnan(pixel_values).any().item()}")
+            logger.debug(f"Vision Input {self._vision_debug_count}:")
+            logger.debug(f"  pixel_values: shape={pixel_values.shape}, dtype={pixel_values.dtype}")
+            logger.debug(f"  pixel min/max: {pixel_values.min().item():.4f} / {pixel_values.max().item():.4f}")
+            logger.debug(f"  has NaN: {torch.isnan(pixel_values).any().item()}")
             self._vision_debug_count += 1
         
         # Convert to float32 for numerical stability
@@ -228,7 +237,7 @@ class QwenQwenHybrid(nn.Module):
         # This is CRITICAL - no_grad breaks training completely!
         
         # Disable autocast to keep everything in fp32
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast('cuda', enabled=False):
             vision_features = self.vision_model(pixel_values, grid_thw=image_grid_thw)
             
         # Convert to float32 to match our replaced layer
@@ -239,19 +248,19 @@ class QwenQwenHybrid(nn.Module):
         
         # Check if vision model output is NaN
         if torch.isnan(vision_features).any():
-            print(f"WARNING: Vision model output contains NaN!")
-            print(f"  Shape: {vision_features.shape}")
+            logger.warning(f"Vision model output contains NaN!")
+            logger.warning(f"  Shape: {vision_features.shape}")
             # Don't replace with zeros - let's see what happens
             # vision_features = torch.zeros_like(vision_features)
         
         # Check for NaN and clip if needed
         if torch.isnan(vision_features).any() or torch.isinf(vision_features).any():
-            print(f"WARNING: Vision features contain NaN/Inf!")
-            print(f"  Max before fix: {vision_features.abs().max().item() if not torch.isnan(vision_features).all() else 'all nan'}")
+            logger.warning(f"Vision features contain NaN/Inf!")
+            logger.warning(f"  Max before fix: {vision_features.abs().max().item() if not torch.isnan(vision_features).all() else 'all nan'}")
             vision_features = torch.nan_to_num(vision_features, nan=0.0, posinf=1.0, neginf=-1.0)
             # Also clip to reasonable range
             vision_features = torch.clamp(vision_features, min=-10.0, max=10.0)
-            print(f"  Max after fix: {vision_features.abs().max().item()}")
+            logger.warning(f"  Max after fix: {vision_features.abs().max().item()}")
             
         # vision_features shape: [total_patches, qwen3_hidden_dim] after our replaced merger
         return vision_features
@@ -344,8 +353,8 @@ class QwenQwenHybrid(nn.Module):
                 v_mean = vision_embeds.abs().mean().item()
                 t_max = pre_marker_embeds.abs().max().item() if pre_marker_embeds.shape[0] > 0 else 0
                 t_mean = pre_marker_embeds.abs().mean().item() if pre_marker_embeds.shape[0] > 0 else 0
-                print(f"    Vision embeds: max={v_max:.4f}, mean={v_mean:.4f}")
-                print(f"    Text embeds: max={t_max:.4f}, mean={t_mean:.4f}")
+                logger.debug(f"    Vision embeds: max={v_max:.4f}, mean={v_mean:.4f}")
+                logger.debug(f"    Text embeds: max={t_max:.4f}, mean={t_mean:.4f}")
             
             # Don't scale for now - let's see raw values
             # vision_embeds = vision_embeds * 0.5
@@ -401,17 +410,17 @@ class QwenQwenHybrid(nn.Module):
             # Check label distribution
             non_masked = (padded_labels != -100).sum().item()
             total = padded_labels.numel()
-            print(f"\nDEBUG Loss calculation (sample {self._debug_loss_counter}):")
-            print(f"  Labels shape: {padded_labels.shape}")
-            print(f"  Non-masked tokens: {non_masked}/{total} ({non_masked/total*100:.1f}%)")
-            print(f"  Padded embeds requires_grad: {padded_embeds.requires_grad}")
+            logger.debug(f"Loss calculation (sample {self._debug_loss_counter}):")
+            logger.debug(f"  Labels shape: {padded_labels.shape}")
+            logger.debug(f"  Non-masked tokens: {non_masked}/{total} ({non_masked/total*100:.1f}%)")
+            logger.debug(f"  Padded embeds requires_grad: {padded_embeds.requires_grad}")
             
             # Check for NaN/Inf in embeddings
             has_nan = torch.isnan(padded_embeds).any().item()
             has_inf = torch.isinf(padded_embeds).any().item()
             embed_max = padded_embeds.abs().max().item()
             embed_mean = padded_embeds.abs().mean().item()
-            print(f"  Embeddings: has_nan={has_nan}, has_inf={has_inf}, max={embed_max:.4f}, mean={embed_mean:.4f}")
+            logger.debug(f"  Embeddings: has_nan={has_nan}, has_inf={has_inf}, max={embed_max:.4f}, mean={embed_mean:.4f}")
             
         output = self.language_model(
             inputs_embeds=padded_embeds, attention_mask=padded_mask,
@@ -419,15 +428,15 @@ class QwenQwenHybrid(nn.Module):
         )
         
         if self._debug_loss_counter < 5 and hasattr(output, 'loss'):
-            print(f"  Output loss: {output.loss.item() if output.loss is not None else 'None'}")
+            logger.debug(f"  Output loss: {output.loss.item() if output.loss is not None else 'None'}")
             if output.loss is not None and torch.isnan(output.loss):
-                print(f"  WARNING: Loss is NaN!")
+                logger.error(f"Loss is NaN!")
                 # Check logits
                 if hasattr(output, 'logits'):
                     logits_max = output.logits.abs().max().item()
                     logits_has_nan = torch.isnan(output.logits).any().item()
                     logits_has_inf = torch.isinf(output.logits).any().item()
-                    print(f"  Logits: has_nan={logits_has_nan}, has_inf={logits_has_inf}, max={logits_max:.4f}")
+                    logger.error(f"  Logits: has_nan={logits_has_nan}, has_inf={logits_has_inf}, max={logits_max:.4f}")
             
         return output
 
@@ -444,7 +453,7 @@ class QwenQwenHybrid(nn.Module):
         }
         torch.save(trainable_state_dict, path / "vision_adapter.pt")
         self.tokenizer.save_pretrained(save_directory)
-        print(f"Finished hybrid model saved to {save_directory}")
+        logger.info(f"Finished hybrid model saved to {save_directory}")
 
     @classmethod
     def from_pretrained(cls, model_directory: str):
@@ -457,14 +466,14 @@ class QwenQwenHybrid(nn.Module):
         model.vision_model.merger.load_state_dict(adapter_state['vision_merger_state'])
         model.vision_start_embedding.data = adapter_state['vision_start_embedding'].data
         model.vision_end_embedding.data = adapter_state['vision_end_embedding'].data
-        print(f"Loaded hybrid model from {model_directory}")
+        logger.info(f"Loaded hybrid model from {model_directory}")
         return model
 
 # --- Test ---
 if __name__ == "__main__":
     model = FinishedQwenR1Hybrid()
     trainable_params = sum(p.numel() for p in model.get_trainable_parameters())
-    print(f"\nTotal trainable parameters: {trainable_params:,}")
+    logger.info(f"Total trainable parameters: {trainable_params:,}")
     model.save_pretrained("./qwen_r1_finished_hybrid")
     loaded_model = FinishedQwenR1Hybrid.from_pretrained("./qwen_r1_finished_hybrid")
-    print("\nModel saved and loaded successfully!")
+    logger.info("Model saved and loaded successfully!")

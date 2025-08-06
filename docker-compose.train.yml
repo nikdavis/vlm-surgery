@@ -35,6 +35,7 @@ services:
       - ./cot:/app/cot  # New CoT dataset images
       - ./outputs-synth:/app/outputs-synth
       - ./outputs_qwen:/app/outputs_qwen
+      - ./outputs_qwen_hybrid:/app/outputs_qwen_hybrid
       - ~/.cache/huggingface:/root/.cache/huggingface
 
     # Increase shared memory for larger batch sizes (same as inference compose)
