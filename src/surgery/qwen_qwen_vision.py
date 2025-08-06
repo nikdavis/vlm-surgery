@@ -5,6 +5,7 @@ from typing import Optional
 from pathlib import Path
 import json
 from loguru import logger
+from peft import LoraConfig, get_peft_model, TaskType
 
 
 #   1. The Qwen2.5-VL visual model has a merger component that contains:
@@ -49,6 +50,22 @@ class QwenQwenHybrid(nn.Module):
         )
         self.tokenizer = AutoTokenizer.from_pretrained(language_model_name)
         r1_hidden_dim = self.language_model.config.hidden_size
+        
+        # --- Add QLoRA to language model ---
+        logger.info("Adding QLoRA adapter to language model with rank=8")
+        lora_config = LoraConfig(
+            r=8,  # Low rank for memory efficiency
+            lora_alpha=16,  # Scaling factor
+            target_modules=["q_proj", "v_proj"],  # Target attention layers
+            lora_dropout=0.1,
+            bias="none",
+            task_type=TaskType.CAUSAL_LM,
+        )
+        self.language_model = get_peft_model(self.language_model, lora_config)
+        
+        # Print LoRA trainable parameters
+        lora_params = sum(p.numel() for n, p in self.language_model.named_parameters() if p.requires_grad and 'lora' in n.lower())
+        logger.info(f"LoRA trainable parameters: {lora_params:,}")
 
         # --- 2. Replace Qwen's merger projection to match Qwen3's dimension ---
         logger.info(f"Replacing Qwen merger projection: {qwen_output_dim} -> {r1_hidden_dim}")
@@ -145,7 +162,10 @@ class QwenQwenHybrid(nn.Module):
         logger.info("Trainable components:")
         for name, param in self.named_parameters():
             if param.requires_grad:
-                logger.debug(f"  {name}: {param.shape}")
+                if 'lora' in name.lower():
+                    logger.debug(f"  [LoRA] {name}: {param.shape}")
+                else:
+                    logger.debug(f"  {name}: {param.shape}")
 
     def get_input_embeddings(self):
         """Get input embeddings from the language model."""
@@ -452,8 +472,12 @@ class QwenQwenHybrid(nn.Module):
             'vision_end_embedding': self.vision_end_embedding,
         }
         torch.save(trainable_state_dict, path / "vision_adapter.pt")
+        
+        # Save LoRA adapter separately using PEFT's save method
+        self.language_model.save_pretrained(path / "lora_adapter")
+        
         self.tokenizer.save_pretrained(save_directory)
-        logger.info(f"Finished hybrid model saved to {save_directory}")
+        logger.info(f"Hybrid model with LoRA saved to {save_directory}")
 
     @classmethod
     def from_pretrained(cls, model_directory: str):
@@ -466,6 +490,16 @@ class QwenQwenHybrid(nn.Module):
         model.vision_model.merger.load_state_dict(adapter_state['vision_merger_state'])
         model.vision_start_embedding.data = adapter_state['vision_start_embedding'].data
         model.vision_end_embedding.data = adapter_state['vision_end_embedding'].data
+        
+        # Load LoRA adapter if it exists
+        lora_path = path / "lora_adapter"
+        if lora_path.exists():
+            from peft import PeftModel
+            # Need to load on top of the base model, not the already-peft model
+            base_model = model.language_model.base_model.model if hasattr(model.language_model, 'base_model') else model.language_model
+            model.language_model = PeftModel.from_pretrained(base_model, str(lora_path))
+            logger.info(f"Loaded LoRA adapter from {lora_path}")
+        
         logger.info(f"Loaded hybrid model from {model_directory}")
         return model
 
