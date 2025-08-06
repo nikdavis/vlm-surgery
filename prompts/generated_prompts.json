@@ -1,0 +1,22 @@
+{
+  "hackernews_01_base": {
+    "xml_prompts": [
+      "Generate an XML document with a root element `<stories>`. Inside, create a list of `<story>` elements, each containing these child elements: `<rank>`, `<title>`, `<link>`, `<points>`, `<user>`, `<time>`, and `<comments>`.",
+      "Create an XML structure with a root element `<news_feed>`. It should contain multiple `<article>` elements. Each `<article>` must have a `rank` attribute and the following child tags: `<headline>`, `<url>`, `<score>`, `<author>`, `<posted_at>`, and `<comment_count>`."
+    ],
+    "json_prompts": [
+      "Create a JSON object with a key 'stories' that holds an array of objects. Each object must contain the keys: 'rank' (number), 'title' (string), 'link' (string), 'points' (number), 'user' (string), 'time' (string), and 'comments' (number).",
+      "Produce a JSON object with a root key 'articles'. This key should hold an array of article objects. Each object must have 'id' (number), 'headline' (string), 'source_url' (string), 'score' (number), and a nested 'meta' object containing 'author' (string) and 'timestamp' (string)."
+    ]
+  },
+  "hackernews_02_loose": {
+    "xml_prompts": [
+      "Generate an XML document with a root <stories> element containing a list of <story> nodes. Each <story> should have child elements for rank, title, link, points, user, time, and comments.",
+      "Extract a list of stories as XML. Each story should be a <story> element with a 'rank' attribute, and nested tags for title, link, points, user, time, and comments."
+    ],
+    "json_prompts": [
+      "Create a JSON object with a 'stories' key, which holds an array of story objects. Each object must include rank, title, link, points, user, time, and comments.",
+      "Extract the top stories into a JSON array under the key 'stories'. Each story in the array should be an object with keys for its rank, title, link, points, submitting user, time posted, and number of comments."
+    ]
+  }
+}

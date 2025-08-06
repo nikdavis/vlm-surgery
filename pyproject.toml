@@ -28,6 +28,7 @@ dependencies = [
     "muon-optimizer",
     "timm>=1.0.19",
     "einops>=0.8.1",
+    "pytest>=8.4.1",
 ]
 
 [tool.uv.sources]

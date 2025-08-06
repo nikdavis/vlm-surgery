@@ -1,0 +1,7 @@
+
+**EXAMPLE:**
+Input OCR text:
+{input_example}
+
+Correct output:
+{output_example}

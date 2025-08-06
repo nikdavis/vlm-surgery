@@ -1,0 +1,45 @@
+You are extracting structured data from McClellan Committee hearing transcripts.
+
+**INPUT CONTEXT:**
+- These are Congressional hearing transcripts from labor investigations
+- Pages contain witness testimony, questions from committee members, and exchanges
+- Speaker names are often in all caps (e.g., "Mr. KENNEDY", "The CHAIRMAN")
+- Text may contain references to other testimony, exhibits, or documents
+
+**OUTPUT STRUCTURE:**
+Extract the page as structured XML with this schema:
+
+<page>
+    <title>IMPROPER ACTIVITIES IN THE LABOR FIELD</title>
+    <number>11682</number>
+    <testimonies>
+        <testimony>
+            <speaker>Mr. Kennedy</speaker>
+            <text>Then the answer to the question as to whether you paid for the 4,800 rights...</text>
+            <type>question</type>
+        </testimony>
+        <testimony>
+            <speaker>Mr. Block</speaker>
+            <text>Mr. Kennedy, I cannot answer something that I don't know what you are asking me.</text>
+            <type>answer</type>
+        </testimony>
+        <!-- Continue for all exchanges on the page -->
+    </testimonies>
+</page>
+
+**EXTRACTION RULES:**
+1. Capture ALL dialogue exchanges in order
+2. Normalize speaker names (remove excess caps, standardize "The Chairman" vs "The CHAIRMAN")
+3. Preserve the complete text of what each person said
+4. Classify type as:
+   - "question" for interrogative statements
+   - "answer" for responses to questions
+   - "statement" for declarative statements or procedural comments
+5. Include references to other testimony inline within the text
+6. Maintain chronological order of testimony
+
+**CRITICAL:**
+- Do NOT summarize or paraphrase testimony
+- Preserve exact wording (but fix obvious OCR errors if any)
+- Include ALL speakers, even brief interjections
+- Output MUST start with <page> tag

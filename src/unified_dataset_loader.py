@@ -270,10 +270,12 @@ class UnifiedOCRDataset(Dataset):
         # Build response
         response = example["response"]
         if self.enable_cot and response.get("thinking"):
-            # Use R1's native thinking tokens instead of <thk>
+            # Use native thinking tokens when CoT is enabled
             output = f"<think>\n{response['thinking']}\n</think>\n{response['output']}"
         else:
-            output = response["output"]
+            # When CoT is disabled, DON'T add thinking tokens - Qwen3 tokenizer adds them automatically
+            # The tokenizer will add empty <think>\n\n</think>\n\n before the output
+            output = response['output']
         
         # Format as messages - images MUST come before text for Qwen
         user_content = []
