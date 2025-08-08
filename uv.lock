@@ -600,7 +600,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "accelerate", specifier = ">=0.24.0" },
-    { name = "bitsandbytes", specifier = ">=0.41.0" },
+    { name = "bitsandbytes", specifier = ">=0.46.1" },
     { name = "boto3", specifier = ">=1.26.0" },
     { name = "click", specifier = ">=8.2.1" },
     { name = "datasets", specifier = ">=2.14.0" },

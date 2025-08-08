@@ -14,7 +14,7 @@ dependencies = [
     "datasets>=2.14.0",
     "accelerate>=0.24.0",
     "peft>=0.7.0",
-    "bitsandbytes>=0.41.0",
+    "bitsandbytes>=0.46.1",
     "trl>=0.7.0",
     "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git",
     "mlflow>=3.1.4",

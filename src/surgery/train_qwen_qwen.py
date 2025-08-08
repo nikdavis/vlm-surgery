@@ -5,7 +5,7 @@ This script uses gradient checkpointing to save memory.
 """
 from pathlib import Path
 import torch
-from transformers import Trainer, TrainingArguments, AutoTokenizer, AutoProcessor
+from transformers import Trainer, TrainingArguments, AutoTokenizer, AutoProcessor, TrainerCallback
 from transformers.optimization import Adafactor, AdafactorSchedule
 from typing import List, Dict, Any, Optional
 import click
@@ -14,6 +14,7 @@ import mlflow
 from loguru import logger
 import os
 import torch.utils.data
+from math import ceil, cos, pi
 
 # Configure loguru from environment
 log_level = os.getenv('LOGURU_LEVEL', 'INFO')
@@ -29,13 +30,13 @@ class AdapterOnlyTrainer(Trainer):
     """Custom trainer that only saves the adapter weights, not the full model."""
     
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
-        """Override save to only save adapter weights using the model's save_pretrained method."""
+        """Override save to only save merger MLP weights using the model's save_pretrained method."""
         output_dir = output_dir if output_dir is not None else self.args.output_dir
         os.makedirs(output_dir, exist_ok=True)
         
-        logger.info(f"Saving adapter weights to {output_dir}")
+        logger.info(f"Saving merger MLP weights to {output_dir}")
         
-        # Use the model's custom save_pretrained method which only saves adapter weights
+        # Use the model's custom save_pretrained method which only saves merger weights
         if hasattr(self.model, 'save_pretrained'):
             self.model.save_pretrained(output_dir)
         else:
@@ -55,7 +56,7 @@ class AdapterOnlyTrainer(Trainer):
         with open(os.path.join(output_dir, 'training_args.json'), 'w') as f:
             json.dump(self.args.to_dict(), f, indent=2)
         
-        logger.info(f"Adapter checkpoint saved successfully")
+        logger.info(f"Merger MLP checkpoint saved successfully")
 
 
 class CoTDataCollator:
@@ -227,10 +228,25 @@ class CoTDataCollator:
             if i < 2 and not hasattr(self, '_assistant_debug_logged'):
                 logger.info(f"Sample {i} assistant token search:")
                 logger.info(f"  Looking for tokens: {assistant_prompt}")
-                logger.info(f"  First 20 tokens in sample: {input_id_list[:20]}")
-                # Decode to see actual text
-                sample_text = self.tokenizer.decode(input_id_list[:100])
-                logger.info(f"  First 100 chars decoded: {sample_text[:100]}")
+                logger.info(f"  Total tokens in sample: {len(input_id_list)}")
+                logger.info(f"  First 20 tokens: {input_id_list[:20]}")
+                # Check if assistant tokens exist anywhere
+                assistant_found = False
+                for j in range(len(input_id_list) - len(assistant_prompt) + 1):
+                    if all(input_id_list[j + k] == assistant_prompt[k] for k in range(len(assistant_prompt))):
+                        assistant_found = True
+                        logger.info(f"  ✓ Found assistant tokens at position {j}")
+                        # Show context around it
+                        context_start = max(0, j - 10)
+                        context_end = min(len(input_id_list), j + 20)
+                        context_text = self.tokenizer.decode(input_id_list[context_start:context_end])
+                        logger.info(f"  Context: ...{context_text}...")
+                        break
+                if not assistant_found:
+                    logger.warning(f"  ✗ Assistant tokens NOT found in sample!")
+                    # Show the full decoded text to debug
+                    full_text = self.tokenizer.decode(input_id_list)
+                    logger.info(f"  Full text (first 500 chars): {full_text[:500]}")
                 self._assistant_debug_logged = True
             
             if len(assistant_prompt) > 0:
@@ -276,8 +292,8 @@ class CoTDataCollator:
                 # Only log for first batch to reduce spam
                 if i < 2 and not hasattr(self, '_mask_logged'):
                     masked_count = assistant_pos
-                    total_count = len(input_id_list)
-                    logger.info(f"  Sample {i}: Masked {masked_count} tokens before assistant response")
+                    total_count = (labels[i] != self.tokenizer.pad_token_id).sum().item()
+                    logger.info(f"  Sample {i}: Masked {masked_count} tokens before assistant response, {total_count - masked_count} tokens remain for training")
                     self._mask_logged = True
             else:
                 # Only log occasionally to reduce spam
@@ -285,9 +301,17 @@ class CoTDataCollator:
                     self._assistant_not_found_count = 0
                 self._assistant_not_found_count += 1
                 if self._assistant_not_found_count <= 3:  # Only log first 3 times
-                    logger.info(f"Could not find assistant token in sample {i}")
-                # As fallback, don't mask anything - at least we'll train on something
-                continue
+                    logger.warning(f"Could not find assistant token in sample {i} - will train on full sequence")
+                    # Show what we have
+                    if i == 0:
+                        decoded = self.tokenizer.decode(input_id_list[:200])
+                        logger.info(f"  First 200 chars: {decoded[:200]}")
+                # As fallback, mask just the user prompt portion
+                # Look for where the image_pad token is and mask up to there plus a bit
+                if self.placeholder_id in input_id_list:
+                    pad_idx = input_id_list.index(self.placeholder_id)
+                    # Mask up to and including the placeholder + some context
+                    labels[i, :pad_idx+10] = -100  # Mask user prompt + a bit of context
 
         # Mask padding tokens
         labels[labels == self.tokenizer.pad_token_id] = -100
@@ -320,14 +344,75 @@ class CoTDataCollator:
             
         return result
 
+class PercentCurriculum(TrainerCallback):
+    """Curriculum callback that adjusts K and gate based on training progress percentage."""
+    def __init__(self, start_k=16, end_k=64, gate_max=1.5, stage1_pct=0.15, ramp_end_pct=0.50):
+        self.start_k, self.end_k = start_k, end_k
+        self.gate_max = gate_max
+        self.stage1_pct = stage1_pct
+        self.ramp_end_pct = ramp_end_pct
+        self.total_updates = None
+
+    def on_step_end(self, args, state, control, model=None, **kwargs):
+        # Model is passed directly, not in kwargs
+        if model is None:
+            return control
+            
+        # Initialize total updates based on state/args
+        if self.total_updates is None:
+            if state.max_steps and state.max_steps > 0:
+                self.total_updates = state.max_steps
+            else:
+                # Estimate from epochs and dataset size
+                # This is approximate since we don't have direct access to dataloader
+                self.total_updates = int(args.num_train_epochs * 100)  # Rough estimate
+        
+        t = state.global_step
+        T = max(1, self.total_updates)
+        p = min(1.0, t / T)  # progress 0..1
+
+        # Stage 1: keep extras off
+        if p <= self.stage1_pct:
+            model.base_k = self.start_k
+            if hasattr(model, "use_soft_gate") and model.use_soft_gate:
+                with torch.no_grad():
+                    model.extra_gate.data.fill_(0.0)
+            return control
+
+        # Stage 2: ramp K and gate (cosine ramp)
+        ramp_p = (p - self.stage1_pct) / max(1e-6, (self.ramp_end_pct - self.stage1_pct))
+        ramp_p = max(0.0, min(1.0, ramp_p))
+        # cosine 0→1: smooth
+        smooth = 0.5 * (1 - cos(pi * ramp_p))
+        K = int(round(self.start_k + smooth * (self.end_k - self.start_k)))
+        model.base_k = K
+        if hasattr(model, "use_soft_gate") and model.use_soft_gate:
+            g = smooth * self.gate_max
+            with torch.no_grad():
+                model.extra_gate.data.fill_(g)
+        return control
+
 @click.command()
 @click.option("--output-dir", default="./outputs_qwen_hybrid", help="Output directory for checkpoints.")
 @click.option("--data-path", default="./datasetv2/combined_dataset.json", help="Path to the unified dataset JSON file.")
 @click.option("--batch-size", type=int, default=1, help="Training batch size per device.")
 @click.option("--gradient-accumulation", type=int, default=32, help="Gradient accumulation steps.")
-@click.option("--learning-rate", type=float, default=1e-5, help="Learning rate for the adapter.")
+@click.option("--learning-rate", type=float, default=2e-5, help="Learning rate for the adapter.")
 @click.option("--num-epochs", type=int, default=3, help="Number of training epochs.")
-def main(output_dir, data_path, batch_size, gradient_accumulation, learning_rate, num_epochs):
+@click.option("--use-8bit-adam", is_flag=True, help="Use 8-bit Adam optimizer instead of AdaFactor")
+@click.option("--exclude-v1-data/--include-v1-data", default=True, help="Exclude/include v1 data (test_data_200 examples)")
+@click.option("--exclude-captions/--include-captions", default=False, help="Exclude/include captions dataset")
+@click.option("--quick-test", is_flag=True, help="Quick test mode: 10 examples, no accumulation, eval at step 1")
+def main(output_dir, data_path, batch_size, gradient_accumulation, learning_rate, num_epochs, use_8bit_adam, exclude_v1_data, exclude_captions, quick_test):
+    # Quick test mode overrides
+    if quick_test:
+        logger.info("🚀 QUICK TEST MODE - Minimal training for validation")
+        batch_size = 1
+        gradient_accumulation = 1
+        num_epochs = 1
+        exclude_captions = True  # Skip large caption dataset
+        logger.info(f"  Settings: batch={batch_size}, accum={gradient_accumulation}, epochs={num_epochs}")
+    
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
@@ -348,17 +433,93 @@ def main(output_dir, data_path, batch_size, gradient_accumulation, learning_rate
     logger.info("Thinking can be enabled at inference with enable_thinking=True")
 
     # 2. Load the dataset without CoT (we'll strip thinking tokens)
-    full_dataset = UnifiedOCRDataset(data_path, enable_cot=False)
-    train_dataset, val_dataset = full_dataset.get_train_val_split(val_ratio=0.02)
+    # Always include captions dataset by default
+    data_paths = [data_path]
     
-    # Limit validation set size to avoid OOM during evaluation
-    # Take only first 10 samples for validation to keep memory usage low
-    if len(val_dataset) > 10:
-        logger.info(f"Limiting validation set from {len(val_dataset)} to 10 samples to avoid OOM")
-        val_dataset = torch.utils.data.Subset(val_dataset, range(10))
+    # Check for captions in Docker or local path - use normalized filename
+    captions_paths = [
+        Path("/app/data-captions/pixelprose_captions.parquet"),  # Docker
+        Path("./data-captions/pixelprose_captions.parquet"),  # Local
+    ]
+    
+    if not exclude_captions:
+        for captions_path in captions_paths:
+            if captions_path.exists():
+                data_paths.append(str(captions_path))
+                logger.info(f"Including captions dataset: {captions_path}")
+                break
+        else:
+            logger.warning("Captions dataset not found in expected locations")
+    
+    full_dataset = UnifiedOCRDataset(data_paths, enable_cot=False)
+    
+    # Filter out v1 data if requested
+    if exclude_v1_data:
+        logger.info("Filtering out v1 data (test_data_200 examples)...")
+        original_len = len(full_dataset)
+        
+        # Create filtered indices - exclude items with test_data_200 in image path
+        filtered_indices = []
+        for idx in range(len(full_dataset)):
+            sample = full_dataset[idx]
+            # Check if any image path contains test_data_200
+            has_v1_data = False
+            if "images" in sample:
+                for img in sample["images"]:
+                    if hasattr(img, '_path'):
+                        # PIL Image with _path attribute
+                        if "test_data_200" in str(img._path):
+                            has_v1_data = True
+                            break
+            if not has_v1_data:
+                filtered_indices.append(idx)
+        
+        # Create subset with filtered indices
+        import torch.utils.data
+        full_dataset = torch.utils.data.Subset(full_dataset, filtered_indices)
+        logger.info(f"Filtered dataset: {original_len} -> {len(full_dataset)} samples (removed {original_len - len(full_dataset)} v1 samples)")
+    
+    
+    # Quick test mode: use tiny dataset
+    if quick_test:
+        logger.info("Quick test: Using only 10 training examples, 2 validation")
+        # Take first 12 examples total
+        if hasattr(full_dataset, 'examples'):
+            # Direct dataset
+            full_dataset.examples = full_dataset.examples[:12]
+        else:
+            # It's a Subset
+            full_dataset = torch.utils.data.Subset(full_dataset, range(min(12, len(full_dataset))))
+        
+        # Split 10 train, 2 val
+        train_dataset = torch.utils.data.Subset(full_dataset, range(10))
+        val_dataset = torch.utils.data.Subset(full_dataset, range(10, min(12, len(full_dataset))))
+    else:
+        # Normal split
+        if hasattr(full_dataset, 'get_train_val_split'):
+            train_dataset, val_dataset = full_dataset.get_train_val_split(val_ratio=0.02)
+        else:
+            # full_dataset is a Subset, do manual split
+            dataset_len = len(full_dataset)
+            val_size = int(dataset_len * 0.02)
+            train_size = dataset_len - val_size
+            train_dataset, val_dataset = torch.utils.data.random_split(
+                full_dataset, [train_size, val_size]
+            )
+    
+    logger.info(f"Training set size: {len(train_dataset)} samples")
+    logger.info(f"Validation set size: {len(val_dataset)} samples")
 
     # Create run name
-    run_name = f"Qwen-Qwen-NoThinking-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    run_name = f"Qwen-Qwen-QLoRA8bit-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    
+    # Choose optimizer based on flag
+    if use_8bit_adam:
+        optimizer = "paged_adamw_8bit"  # Paged 8-bit Adam from bitsandbytes
+        logger.info("Using paged 8-bit Adam optimizer")
+    else:
+        optimizer = "adafactor"
+        logger.info("Using AdaFactor optimizer")
     
     # 3. Define TrainingArguments (simple, single-GPU version)
     training_args = TrainingArguments(
@@ -373,7 +534,7 @@ def main(output_dir, data_path, batch_size, gradient_accumulation, learning_rate
         fp16=False, # BF16 is better than FP16 for stability
         logging_steps=5,
         save_strategy="steps",
-        save_steps=10,  # Save every 10 steps
+        save_steps=20,  # Save every 20 steps
         save_safetensors=False,  # Disable safetensors to avoid shared tensor issues
         eval_strategy="steps",
         eval_steps=20,  # Evaluate every 20 steps
@@ -382,13 +543,12 @@ def main(output_dir, data_path, batch_size, gradient_accumulation, learning_rate
         remove_unused_columns=False,
         gradient_checkpointing=True, # Enable for memory but we'll customize it
         gradient_checkpointing_kwargs={"use_reentrant": False},
-        optim="adafactor",  # Tell trainer we're using Adafactor
+        optim=optimizer,  # Use chosen optimizer
         report_to="mlflow",  # Enable MLflow logging
         run_name=run_name,
         max_grad_norm=1.0,  # Standard gradient clipping
         warmup_ratio=0.1,  # 10% warmup is more stable than fixed steps
         dataloader_num_workers=0,  # Disable multiprocessing to save memory
-        eval_delay=20,  # Delay first evaluation to step 20
     )
 
     # The Trainer will handle gradient checkpointing based on training_args
@@ -404,6 +564,12 @@ def main(output_dir, data_path, batch_size, gradient_accumulation, learning_rate
         eval_dataset=val_dataset,
         data_collator=CoTDataCollator(tokenizer, processor, placeholder_id=model.config.vision_placeholder_id),
     )
+    
+    # Add curriculum callback for token progression
+    trainer.add_callback(PercentCurriculum(
+        start_k=16, end_k=64, gate_max=1.5, stage1_pct=0.15, ramp_end_pct=0.50
+    ))
+    logger.info("Added curriculum callback: Stage 1 (0-15%), Stage 2 ramp (15-50%), Stage 3 (50-100%)")
 
     # 5. Start training with MLflow tracking
     logger.info("Starting Training")

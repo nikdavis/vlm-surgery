@@ -11,6 +11,8 @@ from typing import List, Dict, Optional, Union
 from PIL import Image
 import torch
 from torch.utils.data import Dataset
+import pandas as pd
+from io import BytesIO
 
 
 class UnifiedOCRDataset(Dataset):
@@ -48,12 +50,45 @@ class UnifiedOCRDataset(Dataset):
             if path.is_file() and path.suffix == '.json':
                 # Single JSON file
                 examples.extend(self._load_json_file(path))
+            elif path.is_file() and path.suffix == '.parquet':
+                # Parquet file with captions
+                examples.extend(self._load_parquet_file(path))
             elif path.is_dir():
                 # Directory - check for different formats
                 examples.extend(self._load_directory(path))
             else:
                 print(f"Warning: Skipping {path} - not a file or directory")
         
+        return examples
+    
+    def _load_parquet_file(self, parquet_path: Path) -> List[Dict]:
+        """Load captions dataset from a parquet file."""
+        df = pd.read_parquet(parquet_path)
+        examples = []
+        
+        for idx, row in df.iterrows():
+            # Convert the parquet row to our unified format
+            # The image is stored as bytes in the parquet
+            example = {
+                "id": row.get("image_id", f"caption_{idx}"),
+                "images": [row["image"]],  # Store raw bytes, will handle in __getitem__
+                "prompt": "Please generate a detailed caption for this image.",  # More explicit instruction
+                "response": {
+                    "thinking": "",  # No CoT for captions
+                    "output": row["caption"],
+                    "format": "text"
+                },
+                "metadata": {
+                    "source": "captions",  # Mark as captions dataset
+                    "width": row.get("width"),
+                    "height": row.get("height"),
+                    "aesthetic_score": row.get("aesthetic_score"),
+                }
+            }
+            
+            examples.append(example)
+        
+        print(f"Loaded {len(examples)} examples from captions dataset ({parquet_path.name})")
         return examples
     
     def _load_json_file(self, json_path: Path) -> List[Dict]:
@@ -215,16 +250,23 @@ class UnifiedOCRDataset(Dataset):
         """Print dataset statistics."""
         # Count by response type
         has_cot = sum(1 for ex in self.examples if ex["response"]["thinking"])
-        has_schema = sum(1 for ex in self.examples if ex["schema"])
+        has_schema = sum(1 for ex in self.examples if ex.get("schema"))
         formats = {}
+        sources = {}
         for ex in self.examples:
             fmt = ex["response"]["format"]
             formats[fmt] = formats.get(fmt, 0) + 1
+            # Track data sources
+            if ex.get("metadata") and ex["metadata"].get("source"):
+                src = ex["metadata"]["source"]
+                sources[src] = sources.get(src, 0) + 1
         
         print(f"Dataset stats:")
         print(f"  - Examples with CoT: {has_cot}/{len(self.examples)}")
         print(f"  - Examples with schema: {has_schema}/{len(self.examples)}")
         print(f"  - Output formats: {formats}")
+        if sources:
+            print(f"  - Data sources: {sources}")
     
     def __len__(self):
         return len(self.examples)
@@ -235,13 +277,19 @@ class UnifiedOCRDataset(Dataset):
         
         # Load images
         images = []
-        for img_path in example["images"]:
-            # Handle absolute paths that need remapping for Docker
-            if img_path.startswith("/home/") and os.path.exists("/app/"):
-                # We're in Docker - remap the path
-                img_path = img_path.replace("/home/nik/code/langgraph-work-dir/fine-pixtral/", "/app/")
-            
-            img = Image.open(img_path).convert("RGB")
+        for img_data in example["images"]:
+            if isinstance(img_data, bytes):
+                # Image data from parquet (captions dataset)
+                img = Image.open(BytesIO(img_data)).convert("RGB")
+            else:
+                # File path
+                img_path = img_data
+                # Handle absolute paths that need remapping for Docker
+                if img_path.startswith("/home/") and os.path.exists("/app/"):
+                    # We're in Docker - remap the path
+                    img_path = img_path.replace("/home/nik/code/langgraph-work-dir/fine-pixtral/", "/app/")
+                
+                img = Image.open(img_path).convert("RGB")
             
             # Resize very large images to prevent token mismatch
             # Qwen typically handles up to 2048x2048 well

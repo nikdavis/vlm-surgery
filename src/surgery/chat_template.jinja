@@ -1,0 +1,37 @@
+{% for message in messages %}
+{%- if message['role'] == 'user' %}
+<|im_start|>user
+{%- if message.get('images') or (message.get('content') and isinstance(message['content'], list)) %}
+{%- for item in message['content'] %}
+{%- if item['type'] == 'image' %}
+<|vision_start|><|image_pad|><|vision_end|>
+{%- elif item['type'] == 'text' %}
+{{ item['text'] }}
+{%- endif %}
+{%- endfor %}
+{%- else %}
+{{ message['content'] }}
+{%- endif %}
+<|im_end|>
+{%- elif message['role'] == 'assistant' %}
+<|im_start|>assistant
+{%- if message.get('thinking') %}
+<think>
+{{ message['thinking'] }}
+</think>
+
+{%- endif %}
+{{ message['content'] }}
+<|im_end|>
+{%- elif message['role'] == 'system' %}
+<|im_start|>system
+{{ message['content'] }}
+<|im_end|>
+{%- endif %}
+{% endfor %}
+{%- if add_generation_prompt %}
+<|im_start|>assistant
+{%- if enable_thinking %}
+<think>
+{%- endif %}
+{%- endif %}

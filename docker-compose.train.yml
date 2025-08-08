@@ -31,6 +31,7 @@ services:
       - ./src:/app/src
       - ./data-cot:/app/data-cot  # Keep legacy for backward compatibility
       - ./datasetv2:/app/datasetv2  # New unified dataset
+      - ./data-captions:/app/data-captions  # Captions dataset parquet files
       - ./test_data_200:/app/test_data_200  # Visual reasoning dataset images
       - ./cot:/app/cot  # New CoT dataset images
       - ./outputs-synth:/app/outputs-synth

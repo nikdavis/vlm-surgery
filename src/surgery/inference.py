@@ -15,9 +15,9 @@ from src.surgery.qwen_qwen_vision import QwenQwenHybrid
 
 @click.command()
 @click.option("--checkpoint", default="./outputs_qwen_hybrid/checkpoint-70", help="Path to checkpoint or merged model")
-@click.option("--image", required=True, help="Path to image file")
+@click.option("--image", default="cot/example_0189/problem_image.jpg", help="Path to image file")
 @click.option("--prompt", default="What's in this image?", help="Text prompt")
-@click.option("--max-tokens", default=512, help="Maximum tokens to generate")
+@click.option("--max-tokens", default=100, help="Maximum tokens to generate")
 @click.option("--temperature", default=0.7, help="Sampling temperature")
 @click.option("--enable-thinking", is_flag=True, help="Enable thinking tokens (CoT)")
 def run_inference(checkpoint, image, prompt, max_tokens, temperature, enable_thinking):
@@ -41,6 +41,10 @@ def run_inference(checkpoint, image, prompt, max_tokens, temperature, enable_thi
     
     # Move to GPU
     model = model.cuda().eval()
+    
+    # Clear any cached vision embeddings from previous runs
+    if hasattr(model, 'clear_vision_cache'):
+        model.clear_vision_cache()
     
     # Load processor
     processor = AutoProcessor.from_pretrained("Qwen/Qwen2.5-VL-7B-Instruct")
@@ -78,10 +82,20 @@ def run_inference(checkpoint, image, prompt, max_tokens, temperature, enable_thi
     user_end = model.tokenizer.encode("<|im_start|>user\n", add_special_tokens=False)
     insert_pos = len(user_end)
     
-    # Insert placeholder
+    # Calculate how many vision tokens we need (based on image grid)
+    # This should match the number of patches the vision model produces
+    # For now, just insert 1 placeholder - the model will handle the expansion
+    # But log what's happening
+    logger.info(f"Vision placeholder ID: {vision_placeholder_id}")
+    logger.info(f"Image grid shape: {image_inputs.image_grid_thw}")
+    
+    # Insert placeholder (just one - model expands it)
     input_ids_list = input_ids[0].tolist()
     input_ids_list.insert(insert_pos, vision_placeholder_id)
     input_ids = torch.tensor([input_ids_list])
+    
+    logger.info(f"Input IDs shape after placeholder: {input_ids.shape}")
+    logger.info(f"First 30 tokens: {input_ids[0][:30].tolist()}")
     
     # Move to GPU
     input_ids = input_ids.cuda()
@@ -90,21 +104,54 @@ def run_inference(checkpoint, image, prompt, max_tokens, temperature, enable_thi
     
     logger.info("Running inference...")
     
-    # Generate
+    # Now with caching, we can do proper generation!
     with torch.no_grad():
-        outputs = model.language_model.generate(
-            input_ids=input_ids,
-            pixel_values=pixel_values,
-            image_grid_thw=image_grid_thw,
-            max_new_tokens=max_tokens,
-            temperature=temperature,
-            do_sample=temperature > 0,
-            pad_token_id=model.tokenizer.pad_token_id,
-            eos_token_id=model.tokenizer.eos_token_id,
-        )
+        # First pass will cache vision embeddings
+        generated = input_ids
+        for step in range(max_tokens):
+            # Get next token (vision will be cached after first pass)
+            outputs = model(
+                input_ids=generated,
+                attention_mask=torch.ones_like(generated),
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
+                labels=None,
+            )
+            
+            logits = outputs.logits if hasattr(outputs, 'logits') else outputs
+            next_token_logits = logits[0, -1, :]
+            
+            if temperature > 0:
+                # Apply temperature and sample
+                probs = torch.softmax(next_token_logits / temperature, dim=-1)
+                next_token = torch.multinomial(probs, 1).squeeze()  # Returns [1], squeeze to scalar
+            else:
+                # Greedy decoding
+                next_token = torch.argmax(next_token_logits, dim=-1)  # Returns scalar
+            
+            # Ensure next_token is a scalar, then reshape to [1, 1]
+            if next_token.dim() == 0:
+                next_token = next_token.unsqueeze(0).unsqueeze(0)
+            else:
+                next_token = next_token.view(1, 1)
+            generated = torch.cat([generated, next_token], dim=1)
+            
+            # Stop if EOS token
+            if next_token.item() == model.tokenizer.eos_token_id:
+                break
+            
+            # Log progress every 10 tokens
+            if step % 10 == 0:
+                logger.info(f"Generated {step+1} tokens...")
+        
+        outputs = generated
     
     # Decode response
     response = model.tokenizer.decode(outputs[0], skip_special_tokens=False)
+    
+    # Debug: Let's see what tokens were generated
+    logger.debug(f"Generated token IDs: {outputs[0].tolist()[:50]}...")  # First 50 tokens
+    logger.debug(f"Total tokens generated: {outputs.shape[1]}")
     
     # Extract just the assistant's response
     if "<|im_start|>assistant" in response:
