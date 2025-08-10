@@ -30,7 +30,13 @@ dependencies = [
     "einops>=0.8.1",
     "pytest>=8.4.1",
     "loguru>=0.7.3",
+    "logfire>=4.2.0",
 ]
 
 [tool.uv.sources]
 muon-optimizer = { git = "https://github.com/KellerJordan/Muon" }
+
+[dependency-groups]
+dev = [
+    "numpy>=2.2.6",
+]

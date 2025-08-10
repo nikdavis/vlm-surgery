@@ -36,12 +36,14 @@ RUN pip install --no-cache-dir --break-system-packages \
     "pydantic-xml>=2.17.3" \
     "pydantic>=2.11.7" \
     "loguru>=0.7.3" \
+    "pyarrow>=14.0.0" \
+    "logfire" \
     # Muon optimizer
     "git+https://github.com/KellerJordan/Muon" \
     "timm" \
     "einops"
 
 
-# Default command to show the help message for the training script
+# Default command to run the Qwen-Qwen hybrid training with virtual dataset
 # This makes it easy to see available options when running the container
-CMD ["python3", "-m", "src/train_qwen.py", "--cot", "--output-dir=/app/outputs_qwen"]
+CMD ["python3", "-m", "src.surgery.train_qwen_qwen", "--help"]

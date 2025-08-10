@@ -416,3 +416,181 @@ class ComposeTransforms:
         for transform in self.transforms:
             sample = transform(sample, rng)
         return sample
+
+
+class IdentityOrAug:
+    """
+    Apply identity (no transform) or augmentation based on probability.
+    Supports force_identity flag for two-phase training.
+    """
+    
+    def __init__(self, p_identity: float = 0.3, aug_transforms: Optional[List[Transform]] = None):
+        """
+        Initialize identity-or-augmentation transform.
+        
+        Args:
+            p_identity: Probability of keeping sample unchanged (default 0.3)
+            aug_transforms: List of transforms to apply when augmenting
+        """
+        self.p_identity = p_identity
+        self.aug_pipeline = ComposeTransforms(aug_transforms or [])
+    
+    def __call__(self, sample: Dict[str, Any], rng: np.random.Generator) -> Dict[str, Any]:
+        """
+        Apply identity or augmentation based on probability.
+        
+        Args:
+            sample: Input sample dictionary
+            rng: Random generator for reproducible randomness
+            
+        Returns:
+            Either unchanged sample or augmented sample
+        """
+        # Check for phase A override (force identity)
+        if sample.get('__force_identity__', False):
+            # Don't remove the flag here, let VirtualDataset handle it
+            return sample
+        
+        # Phase B: Apply p_identity probability
+        if rng.random() < self.p_identity:
+            return sample  # Identity (no augmentation)
+        
+        # Apply augmentation pipeline
+        return self.aug_pipeline(sample, rng)
+
+
+class RandomChoice:
+    """
+    Randomly select and apply n transforms from a list.
+    Ensures maximum n augmentations are applied.
+    """
+    
+    def __init__(self, n: int = 2, transforms: Optional[List[Transform]] = None):
+        """
+        Initialize random choice transform.
+        
+        Args:
+            n: Maximum number of transforms to apply (default 2)
+            transforms: List of transforms to choose from
+        """
+        self.n = n
+        self.transforms = transforms or []
+    
+    def __call__(self, sample: Dict[str, Any], rng: np.random.Generator) -> Dict[str, Any]:
+        """
+        Apply n randomly selected transforms.
+        
+        Args:
+            sample: Input sample dictionary
+            rng: Random generator for reproducible randomness
+            
+        Returns:
+            Sample with n transforms applied
+        """
+        if not self.transforms:
+            return sample
+        
+        # Pick n transforms randomly (without replacement)
+        n_to_apply = min(self.n, len(self.transforms))
+        chosen_indices = rng.choice(len(self.transforms), size=n_to_apply, replace=False)
+        
+        # Apply chosen transforms in order
+        for idx in chosen_indices:
+            sample = self.transforms[idx](sample, rng)
+        
+        return sample
+
+
+class GaussianNoise:
+    """
+    Add realistic Gaussian noise to image (simulates sensor noise).
+    """
+    
+    def __init__(self, sigma: float = 0.015):
+        """
+        Initialize Gaussian noise transform.
+        
+        Args:
+            sigma: Standard deviation of noise (default 0.015)
+        """
+        self.sigma = sigma
+    
+    def __call__(self, sample: Dict[str, Any], rng: np.random.Generator) -> Dict[str, Any]:
+        """
+        Add Gaussian noise to image.
+        
+        Args:
+            sample: Dictionary with 'image' key containing PIL Image
+            rng: Random generator for reproducible randomness
+            
+        Returns:
+            Sample with noisy image
+        """
+        if 'image' not in sample:
+            raise KeyError("Sample must have 'image' key")
+        
+        img = sample['image']
+        if not hasattr(img, 'mode'):
+            raise ValueError("Image must be PIL Image. Apply DecodeImage first.")
+        
+        # Convert to numpy array
+        img_array = np.array(img).astype(np.float32) / 255.0
+        
+        # Add Gaussian noise
+        noise = rng.normal(0, self.sigma, img_array.shape).astype(np.float32)
+        noisy_array = img_array + noise
+        
+        # Clip to valid range and convert back
+        noisy_array = np.clip(noisy_array, 0, 1)
+        noisy_img = Image.fromarray((noisy_array * 255).astype(np.uint8))
+        
+        sample['image'] = noisy_img
+        return sample
+
+
+class JPEGCompression:
+    """
+    Simulate JPEG compression artifacts by re-encoding image.
+    """
+    
+    def __init__(self, quality_range: Tuple[int, int] = (70, 95)):
+        """
+        Initialize JPEG compression transform.
+        
+        Args:
+            quality_range: Range of JPEG quality values (default 70-95)
+        """
+        self.quality_range = quality_range
+    
+    def __call__(self, sample: Dict[str, Any], rng: np.random.Generator) -> Dict[str, Any]:
+        """
+        Apply JPEG compression to image.
+        
+        Args:
+            sample: Dictionary with 'image' key containing PIL Image
+            rng: Random generator for reproducible randomness
+            
+        Returns:
+            Sample with JPEG-compressed image
+        """
+        if 'image' not in sample:
+            raise KeyError("Sample must have 'image' key")
+        
+        img = sample['image']
+        if not hasattr(img, 'mode'):
+            raise ValueError("Image must be PIL Image. Apply DecodeImage first.")
+        
+        # Random quality value (ensure it's an int for PIL)
+        quality = int(rng.integers(self.quality_range[0], self.quality_range[1] + 1))
+        
+        # Compress to JPEG and reload
+        buffer = BytesIO()
+        # Convert RGBA to RGB if needed for JPEG
+        if img.mode == 'RGBA':
+            img = img.convert('RGB')
+        img.save(buffer, format='JPEG', quality=quality)
+        buffer.seek(0)
+        compressed_img = Image.open(buffer)
+        
+        sample['image'] = compressed_img
+        return sample

@@ -21,42 +21,98 @@ log_level = os.getenv('LOGURU_LEVEL', 'INFO')
 logger.remove()
 logger.add(lambda msg: print(msg, end=""), level=log_level, format="{time:HH:mm:ss} | {level: <8} | {message}")
 
-# Import the Qwen-Qwen hybrid model and the existing dataset loader
+# Import the Qwen-Qwen hybrid model and dataset loaders
 from src.surgery.qwen_qwen_vision import QwenQwenHybrid
 from src.unified_dataset_loader import UnifiedOCRDataset
+# Import virtual dataset components
+from src.data.adapters import ParquetCaptionAdapter
+from src.data.virtual_dataset import VirtualDataset
+from src.data.transforms import (
+    DecodeImage, RandomResize, RandomCrop, MildColorJitter,
+    IdentityOrAug, RandomChoice, GaussianNoise, JPEGCompression
+)
 
 
 class AdapterOnlyTrainer(Trainer):
     """Custom trainer that only saves the adapter weights, not the full model."""
-    
+
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         """Override save to only save merger MLP weights using the model's save_pretrained method."""
         output_dir = output_dir if output_dir is not None else self.args.output_dir
         os.makedirs(output_dir, exist_ok=True)
-        
+
         logger.info(f"Saving merger MLP weights to {output_dir}")
-        
+
         # Use the model's custom save_pretrained method which only saves merger weights
         if hasattr(self.model, 'save_pretrained'):
             self.model.save_pretrained(output_dir)
         else:
             logger.error("Model doesn't have save_pretrained method!")
-            
-        # Save training state (optimizer, scheduler, etc.) separately
+
+        # Save training state (optimizer, scheduler, etc.) properly
         # This is important for resuming training
-        torch.save({
-            'epoch': self.state.epoch,
-            'global_step': self.state.global_step,
-            'best_metric': self.state.best_metric,
-            'best_model_checkpoint': self.state.best_model_checkpoint,
-        }, os.path.join(output_dir, 'trainer_state.pt'))
-        
+        self.save_state()  # This saves optimizer, scheduler, training state
+
         # Save training args for reference
         import json
         with open(os.path.join(output_dir, 'training_args.json'), 'w') as f:
             json.dump(self.args.to_dict(), f, indent=2)
-        
+
         logger.info(f"Merger MLP checkpoint saved successfully")
+    
+    def _load_from_checkpoint(self, checkpoint: str):
+        """Override to properly load our adapter-only checkpoints."""
+        import torch
+        checkpoint = os.path.abspath(checkpoint.rstrip("/"))
+        adapter_path = os.path.join(checkpoint, "vision_adapter.pt")
+        
+        if os.path.exists(adapter_path):
+            logger.info(f"Loading adapter-only checkpoint from {checkpoint}")
+            
+            # Load the adapter weights
+            state = torch.load(adapter_path, map_location="cpu")
+            
+            # Restore merger and marker embeddings
+            self.model.vision_model.merger.load_state_dict(state["vision_merger_state"])
+            self.model.vision_start_embedding.data.copy_(state["vision_start_embedding"].data)
+            self.model.vision_end_embedding.data.copy_(state["vision_end_embedding"].data)
+            logger.info("✓ Adapter weights restored")
+            
+            # Restore optimizer if present
+            opt_path = os.path.join(checkpoint, "optimizer.pt")
+            if self.optimizer and os.path.exists(opt_path):
+                self.optimizer.load_state_dict(torch.load(opt_path, map_location="cpu"))
+                logger.info("✓ Optimizer state restored")
+            
+            # Restore scheduler if present
+            sched_path = os.path.join(checkpoint, "scheduler.pt")
+            if self.lr_scheduler and os.path.exists(sched_path):
+                self.lr_scheduler.load_state_dict(torch.load(sched_path, map_location="cpu"))
+                logger.info("✓ Scheduler state restored")
+            
+            # Restore RNG state if present
+            rng_path = os.path.join(checkpoint, "rng_state.pth")
+            if os.path.exists(rng_path):
+                self._load_rng_state(checkpoint)
+                logger.info("✓ RNG state restored")
+            
+            # Restore trainer state
+            trainer_state_path = os.path.join(checkpoint, "trainer_state.json")
+            if os.path.exists(trainer_state_path):
+                from transformers.trainer_callback import TrainerState
+                self.state = TrainerState.load_from_json(trainer_state_path)
+                self.control = self.callback_handler.on_train_begin(self.args, self.state, self.control)
+                logger.info(f"✓ Trainer state restored (global_step={self.state.global_step})")
+            
+            # Stop memory tracker and return (skip default weight loading)
+            if hasattr(self, '_memory_tracker') and self._memory_tracker is not None:
+                self._memory_tracker.stop_and_update_metrics(self.state)
+            
+            logger.info(f"Successfully resumed from checkpoint at step {self.state.global_step}")
+            return
+        
+        # Fall back to standard HF checkpoint loading if not adapter-only
+        return super()._load_from_checkpoint(checkpoint)
 
 
 class CoTDataCollator:
@@ -79,12 +135,12 @@ class CoTDataCollator:
         # Now that we know the tokens are compatible, we can use the processor!
         images = []
         messages_for_processor = []
-        
+
         for feature in features:
             # Get images directly from the feature
             feature_images = feature["images"]
             images.extend(feature_images)
-            
+
             # Extract prompt and response from messages
             user_content = feature["messages"][0]["content"]
             prompt = None
@@ -92,10 +148,10 @@ class CoTDataCollator:
                 if item["type"] == "text":
                     prompt = item["text"]
                     break
-            
+
             # Get response text
             response = feature["messages"][1]["content"][0]["text"]
-            
+
             # Build text-only messages for chat template
             messages = [
                 {
@@ -104,17 +160,17 @@ class CoTDataCollator:
                 },
                 {"role": "assistant", "content": response}
             ]
-            
+
             # Apply chat template with text only
             text = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
-            
+
             # Now we need to insert vision tokens manually
             # Replace the start of user content with vision tokens
             # The format should be: <|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>prompt...
-            
+
             # For now, store the text and we'll insert vision tokens after tokenization
             messages_for_processor.append(text)
-        
+
         # Tokenize text first
         inputs = self.tokenizer(
             messages_for_processor,
@@ -123,20 +179,20 @@ class CoTDataCollator:
             max_length=1024,  # Increased to ensure we capture assistant response
             return_tensors=None  # Get list format first
         )
-        
+
         # Now insert vision tokens after "<|im_start|>user\n"
         vision_start_id = self.tokenizer.convert_tokens_to_ids("<|vision_start|>")
         vision_end_id = self.tokenizer.convert_tokens_to_ids("<|vision_end|>")
-        
+
         modified_input_ids = []
         image_idx = 0
-        
+
         for i, (input_ids, feature) in enumerate(zip(inputs.input_ids, features)):
             # Find position after user tag to insert vision tokens
             # Qwen3 R1 uses <｜User｜> format
             # Try multiple patterns
             insert_pos = None
-            
+
             # Pattern 1: Look for <｜User｜> token (151669)
             user_token_id = 151669  # <｜User｜>
             for j in range(len(input_ids) - 1):
@@ -144,7 +200,7 @@ class CoTDataCollator:
                     # Insert right after the user token
                     insert_pos = j + 1
                     break
-            
+
             # Pattern 2: Try the old format as fallback
             if insert_pos is None:
                 user_start_tokens = self.tokenizer.encode("<|im_start|>user\n", add_special_tokens=False)
@@ -152,17 +208,17 @@ class CoTDataCollator:
                     if all(input_ids[j + k] == user_start_tokens[k] for k in range(len(user_start_tokens))):
                         insert_pos = j + len(user_start_tokens)
                         break
-            
+
             if insert_pos is None:
                 # Fallback: just use as-is
                 logger.info(f"Could not find user prompt position in sample {i}")
                 modified_input_ids.append(torch.tensor(input_ids))
                 continue
-            
+
             # Insert ONLY image_pad tokens - the model will add vision_start/end
             num_images = len(feature["images"])
             image_pad_tokens = [self.placeholder_id] * num_images
-            
+
             # Debug: Show where we're inserting (only for first batch)
             if i < 2 and not hasattr(self, '_insertion_logged'):  # First 2 samples, first batch only
                 tokens_before = self.tokenizer.decode(input_ids[:insert_pos])
@@ -171,13 +227,13 @@ class CoTDataCollator:
                 logger.info(f"  Inserting {num_images} image_pad tokens at position {insert_pos}")
                 logger.info(f"  Text before: ...{tokens_before[-50:]}")
                 logger.info(f"  Text after: {tokens_after}...")
-            
+
             # Insert only the image_pad tokens
             new_ids = input_ids[:insert_pos] + image_pad_tokens + input_ids[insert_pos:]
             modified_input_ids.append(torch.tensor(new_ids))
-            
+
             image_idx += num_images
-        
+
         # Now pad sequences
         input_ids = torch.nn.utils.rnn.pad_sequence(modified_input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id)
         attention_mask = torch.nn.utils.rnn.pad_sequence(
@@ -185,7 +241,7 @@ class CoTDataCollator:
             batch_first=True,
             padding_value=0
         )
-        
+
         # Debug: Check if vision tokens were inserted
         if not hasattr(self, '_debug_printed'):
             self._debug_printed = True
@@ -207,23 +263,23 @@ class CoTDataCollator:
                     token_window = input_ids[i][start:end].tolist()
                     logger.info(f"    Token window around placeholder: {token_window}")
             self._insertion_logged = True  # Mark that we've logged insertion
-        
+
         # Process images
         image_outputs = {}
         if images:
             image_inputs = self.image_processor(images, return_tensors="pt")
             image_outputs = image_inputs
-        
+
         labels = input_ids.clone()
 
         # Create the masked labels - mask everything before assistant response
         for i in range(len(features)):
             input_id_list = input_ids[i].tolist()
-            
+
             # Qwen3 uses <|im_start|>assistant format
             assistant_prompt = self.tokenizer.encode("<|im_start|>assistant\n", add_special_tokens=False)
             assistant_pos = None
-            
+
             # Debug: Log what we're looking for vs what we have (only for first few samples)
             if i < 2 and not hasattr(self, '_assistant_debug_logged'):
                 logger.info(f"Sample {i} assistant token search:")
@@ -248,14 +304,14 @@ class CoTDataCollator:
                     full_text = self.tokenizer.decode(input_id_list)
                     logger.info(f"  Full text (first 500 chars): {full_text[:500]}")
                 self._assistant_debug_logged = True
-            
+
             if len(assistant_prompt) > 0:
                 # Find this sequence in the input
                 for j in range(len(input_id_list) - len(assistant_prompt) + 1):
                     if all(input_id_list[j + k] == assistant_prompt[k] for k in range(len(assistant_prompt))):
                         assistant_pos = j + len(assistant_prompt)
                         break
-            
+
             # Try alternative patterns if standard pattern not found
             if assistant_pos is None:
                 # Try pattern 2: <｜Assistant｜> (DeepSeek R1 style)
@@ -266,7 +322,7 @@ class CoTDataCollator:
                         if i < 2:
                             logger.info(f"  Found assistant token 151670 at position {j}")
                         break
-            
+
             # Try pattern 3: Look for "assistant" in any form
             if assistant_pos is None:
                 # Encode just "assistant" and look for it
@@ -285,7 +341,7 @@ class CoTDataCollator:
                                 break
                         if assistant_pos is not None:
                             break
-            
+
             if assistant_pos is not None:
                 # Mask everything before assistant response (user prompt and assistant marker)
                 labels[i, :assistant_pos] = -100
@@ -315,7 +371,7 @@ class CoTDataCollator:
 
         # Mask padding tokens
         labels[labels == self.tokenizer.pad_token_id] = -100
-        
+
         # Debug: Check label masking
         if not hasattr(self, '_label_debug_printed'):
             self._label_debug_printed = True
@@ -337,11 +393,11 @@ class CoTDataCollator:
             "attention_mask": attention_mask,
             "labels": labels
         }
-        
+
         # Add image outputs if we have them
         if image_outputs:
             result.update(image_outputs)
-            
+
         return result
 
 class PercentCurriculum(TrainerCallback):
@@ -365,7 +421,7 @@ class PercentCurriculum(TrainerCallback):
                 updates_per_epoch = ceil(len(trainer.get_train_dataloader()) / ga)
                 epochs = int(args.num_train_epochs)
                 self.total_updates = max(1, updates_per_epoch * epochs)
-        
+
         if self.total_updates:
             logger.info(f"Curriculum: total_updates={self.total_updates}, stages at {int(self.stage1_pct*100)}% and {int(self.ramp_end_pct*100)}%")
 
@@ -373,7 +429,7 @@ class PercentCurriculum(TrainerCallback):
         """Adjust curriculum parameters based on progress."""
         if model is None or self.total_updates is None:
             return control
-        
+
         p = min(1.0, state.global_step / self.total_updates)
 
         # Stage 1: keep extras off
@@ -388,11 +444,11 @@ class PercentCurriculum(TrainerCallback):
         ramp = max(0.0, min(1.0, (p - self.stage1_pct) / (self.ramp_end_pct - self.stage1_pct + 1e-6)))
         smooth = 0.5 * (1 - cos(pi * ramp))
         model.base_k = int(round(self.start_k + smooth * (self.end_k - self.start_k)))
-        
+
         if getattr(model, "use_soft_gate", False):
             with torch.no_grad():
                 model.extra_gate.data.fill_(smooth * self.gate_max)
-        
+
         return control
 
 @click.command()
@@ -407,7 +463,9 @@ class PercentCurriculum(TrainerCallback):
 @click.option("--exclude-v1-data/--include-v1-data", default=True, help="Exclude/include v1 data (test_data_200 examples)")
 @click.option("--exclude-captions/--include-captions", default=False, help="Exclude/include captions dataset")
 @click.option("--quick-test", is_flag=True, help="Quick test mode: 10 examples, no accumulation, eval at step 1")
-def main(output_dir, data_path, batch_size, gradient_accumulation, learning_rate, num_epochs, max_steps, use_8bit_adam, exclude_v1_data, exclude_captions, quick_test):
+@click.option("--resume-from-checkpoint", type=str, default=None, help="Path to checkpoint to resume from")
+@click.option("--disable-curriculum", is_flag=True, help="Disable curriculum learning (auto-disabled when resuming)")
+def main(output_dir, data_path, batch_size, gradient_accumulation, learning_rate, num_epochs, max_steps, use_8bit_adam, exclude_v1_data, exclude_captions, quick_test, resume_from_checkpoint, disable_curriculum):
     # Quick test mode overrides
     if quick_test:
         logger.info("🚀 QUICK TEST MODE - Minimal training for validation")
@@ -416,10 +474,10 @@ def main(output_dir, data_path, batch_size, gradient_accumulation, learning_rate
         num_epochs = 1
         exclude_captions = True  # Skip large caption dataset
         logger.info(f"  Settings: batch={batch_size}, accum={gradient_accumulation}, epochs={num_epochs}")
-    
+
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # Set up MLflow
     mlflow.set_tracking_uri("http://localhost:5000")
     mlflow.set_experiment("qwen-qwen-hybrid-20250805")
@@ -436,54 +494,69 @@ def main(output_dir, data_path, batch_size, gradient_accumulation, learning_rate
     logger.info("Training WITHOUT thinking tokens for stability")
     logger.info("Thinking can be enabled at inference with enable_thinking=True")
 
-    # 2. Load the dataset without CoT (we'll strip thinking tokens)
-    # Always include captions dataset by default
-    data_paths = [data_path]
-    
-    # Check for captions in Docker or local path - use normalized filename
-    captions_paths = [
-        Path("/app/data-captions/pixelprose_captions.parquet"),  # Docker
-        Path("./data-captions/pixelprose_captions.parquet"),  # Local
-    ]
-    
+    # 2. Load the dataset
     if not exclude_captions:
-        for captions_path in captions_paths:
-            if captions_path.exists():
-                data_paths.append(str(captions_path))
-                logger.info(f"Including captions dataset: {captions_path}")
+        # Use virtual dataset for captions
+        # Look for dataset in subdirectory first, then fall back to root
+        captions_patterns = [
+            Path("/app/data-captions/dataset_*/*.parquet"),  # Docker with subdirectory
+            Path("./data-captions/dataset_*/*.parquet"),  # Local with subdirectory
+            Path("/app/data-captions/*.parquet"),  # Docker root (fallback)
+            Path("./data-captions/*.parquet"),  # Local root (fallback)
+        ]
+
+        captions_glob = None
+        for pattern in captions_patterns:
+            # Check if any files match this pattern
+            import glob
+            if glob.glob(str(pattern)):
+                captions_glob = str(pattern)
                 break
+
+        if captions_glob:
+            logger.info(f"Loading captions from {captions_glob} using VirtualDataset")
+            adapter = ParquetCaptionAdapter(captions_glob)
+            
+            # Two-phase transform pipeline:
+            # Phase A: Identity only (DecodeImage)
+            # Phase B: 30% identity, 70% augmented with max 2 transforms
+            transforms = [
+                DecodeImage(),
+                IdentityOrAug(
+                    p_identity=0.3,  # 30% identity in Phase B
+                    aug_transforms=[
+                        RandomChoice(
+                            n=2,  # Apply max 2 augmentations
+                            transforms=[
+                                RandomResize(scale=(0.7, 1.3)),  # Slightly stronger than before
+                                RandomCrop(min_crop_ratio=0.6),  # As requested
+                                MildColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+                                GaussianNoise(sigma=0.015),
+                                JPEGCompression(quality_range=(70, 95))
+                            ]
+                        )
+                    ]
+                )
+            ]
+            
+            full_dataset = VirtualDataset(
+                adapter=adapter,
+                transforms=transforms,
+                virtual_scale_factor=1.5  # 1.5x for coverage + augmentation
+            )
+            logger.info(f"Virtual dataset created with {len(full_dataset)} virtual samples")
         else:
-            logger.warning("Captions dataset not found in expected locations")
-    
-    full_dataset = UnifiedOCRDataset(data_paths, enable_cot=False)
-    
-    # Filter out v1 data if requested
-    if exclude_v1_data:
-        logger.info("Filtering out v1 data (test_data_200 examples)...")
-        original_len = len(full_dataset)
-        
-        # Create filtered indices - exclude items with test_data_200 in image path
-        filtered_indices = []
-        for idx in range(len(full_dataset)):
-            sample = full_dataset[idx]
-            # Check if any image path contains test_data_200
-            has_v1_data = False
-            if "images" in sample:
-                for img in sample["images"]:
-                    if hasattr(img, '_path'):
-                        # PIL Image with _path attribute
-                        if "test_data_200" in str(img._path):
-                            has_v1_data = True
-                            break
-            if not has_v1_data:
-                filtered_indices.append(idx)
-        
-        # Create subset with filtered indices
-        import torch.utils.data
-        full_dataset = torch.utils.data.Subset(full_dataset, filtered_indices)
-        logger.info(f"Filtered dataset: {original_len} -> {len(full_dataset)} samples (removed {original_len - len(full_dataset)} v1 samples)")
-    
-    
+            logger.error("Captions dataset not found in expected locations!")
+            return
+    else:
+        # Use original UnifiedOCRDataset for non-caption data
+        logger.info("Using UnifiedOCRDataset for non-caption data")
+        full_dataset = UnifiedOCRDataset([data_path], enable_cot=False)
+
+    # Skip v1 filtering - we're only using caption data with VirtualDataset
+    if exclude_v1_data and not exclude_captions:
+        logger.info("V1 data filtering not needed for VirtualDataset (captions only)")
+
     # Quick test mode: use tiny dataset
     if quick_test:
         logger.info("Quick test: Using only 10 training examples, 2 validation")
@@ -494,7 +567,7 @@ def main(output_dir, data_path, batch_size, gradient_accumulation, learning_rate
         else:
             # It's a Subset
             full_dataset = torch.utils.data.Subset(full_dataset, range(min(12, len(full_dataset))))
-        
+
         # Split 10 train, 2 val
         train_dataset = torch.utils.data.Subset(full_dataset, range(10))
         val_dataset = torch.utils.data.Subset(full_dataset, range(10, min(12, len(full_dataset))))
@@ -510,13 +583,17 @@ def main(output_dir, data_path, batch_size, gradient_accumulation, learning_rate
             train_dataset, val_dataset = torch.utils.data.random_split(
                 full_dataset, [train_size, val_size]
             )
-    
+
     logger.info(f"Training set size: {len(train_dataset)} samples")
     logger.info(f"Validation set size: {len(val_dataset)} samples")
 
     # Create run name
     run_name = f"Qwen-Qwen-QLoRA8bit-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-    
+
+    # Make output dir unique to avoid overwriting
+    output_dir = Path(output_dir) / run_name
+    output_dir.mkdir(parents=True, exist_ok=True)
+
     # Choose optimizer based on flag
     if use_8bit_adam:
         optimizer = "paged_adamw_8bit"  # Paged 8-bit Adam from bitsandbytes
@@ -524,7 +601,7 @@ def main(output_dir, data_path, batch_size, gradient_accumulation, learning_rate
     else:
         optimizer = "adafactor"
         logger.info("Using AdaFactor optimizer")
-    
+
     # 3. Define TrainingArguments with better defaults
     # Use max_steps if provided, otherwise epochs
     if max_steps and not quick_test:
@@ -536,7 +613,7 @@ def main(output_dir, data_path, batch_size, gradient_accumulation, learning_rate
         training_epochs = num_epochs
         if not quick_test:
             logger.info(f"Training for {num_epochs} epochs")
-    
+
     training_args = TrainingArguments(
         output_dir=str(output_dir),
         per_device_train_batch_size=batch_size,
@@ -588,12 +665,29 @@ def main(output_dir, data_path, batch_size, gradient_accumulation, learning_rate
         eval_dataset=val_dataset,
         data_collator=CoTDataCollator(tokenizer, processor, placeholder_id=model.config.vision_placeholder_id),
     )
-    
-    # Add curriculum callback for token progression
-    trainer.add_callback(PercentCurriculum(
-        start_k=16, end_k=64, gate_max=1.5, stage1_pct=0.15, ramp_end_pct=0.50
-    ))
-    logger.info("Added curriculum callback: Stage 1 (0-15%), Stage 2 ramp (15-50%), Stage 3 (50-100%)")
+
+    # Add curriculum callback for token progression (unless disabled or resuming)
+    if disable_curriculum or resume_from_checkpoint:
+        if resume_from_checkpoint:
+            logger.info("Curriculum disabled (resuming from checkpoint - gate should already be trained)")
+        else:
+            logger.info("Curriculum disabled by flag")
+        
+        # Set model to final curriculum state (fully open gate, max K)
+        if hasattr(model, 'base_k'):
+            model.base_k = 64  # Final K value
+            logger.info(f"Set model.base_k to final value: 64")
+        
+        if hasattr(model, 'use_soft_gate') and model.use_soft_gate:
+            if hasattr(model, 'extra_gate'):
+                with torch.no_grad():
+                    model.extra_gate.data.fill_(1.5)  # Final gate value
+                logger.info(f"Set model.extra_gate to final value: 1.5")
+    else:
+        trainer.add_callback(PercentCurriculum(
+            start_k=16, end_k=64, gate_max=1.5, stage1_pct=0.15, ramp_end_pct=0.50
+        ))
+        logger.info("Added curriculum callback: Stage 1 (0-15%), Stage 2 ramp (15-50%), Stage 3 (50-100%)")
 
     # 5. Start training with MLflow tracking
     logger.info("Starting Training")
@@ -610,25 +704,26 @@ def main(output_dir, data_path, batch_size, gradient_accumulation, learning_rate
             "val_size": len(val_dataset),
             "enable_cot": True,
         })
-        
-        trainer_stats = trainer.train()
-        
+
+        # Train - the AdapterOnlyTrainer will handle checkpoint loading properly
+        trainer_stats = trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+
         # Log final training stats
         mlflow.log_metrics({
             "final_train_loss": trainer_stats.metrics.get('train_loss', 0),
             "total_train_time": trainer_stats.metrics.get('train_runtime', 0),
             "train_samples_per_second": trainer_stats.metrics.get('train_samples_per_second', 0),
         })
-        
+
         logger.info("Training Complete")
-    
+
         # 6. Save the final trained adapter
         model.save_pretrained(str(output_dir / "final_model"))
         logger.info(f"Final model adapter saved to {output_dir / 'final_model'}")
-        
+
         # Log the final model artifacts
         mlflow.log_artifacts(str(output_dir / "final_model"), "model")
-    
+
     logger.info(f"MLflow tracking at: http://localhost:5000")
 
 if __name__ == "__main__":

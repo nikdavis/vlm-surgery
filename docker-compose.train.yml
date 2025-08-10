@@ -18,10 +18,13 @@ services:
       - NVIDIA_VISIBLE_DEVICES=0
       # Optional: avoid CUDA OOM by allowing expandable segments
       - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
       # MinIO/S3 credentials for MLflow artifacts
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
       - MLFLOW_S3_ENDPOINT_URL=${MLFLOW_S3_ENDPOINT_URL}
+      # Logfire token for performance tracking
+      - LOGFIRE_TOKEN=${LOGFIRE_TOKEN}
 
     # Use host networking as in the original `docker run` command
     network_mode: "host"
@@ -56,5 +59,7 @@ services:
               device_ids: ["0"]
               capabilities: ["gpu"]
 
-    # Default command starts the Qwen training script with Muon optimizer
-    command: ["python3", "-m", "src.train_qwen_muon", "--cot", "--output-dir=/app/outputs_qwen", "--muon-lr", "0.02", "--adamw-lr", "3e-4"]
+    # Default command starts the Qwen-Qwen hybrid training script with virtual dataset
+    # Using micro-batch=1, accum=32 to avoid OOM
+    # Using paged 8-bit Adam optimizer for memory efficiency
+    command: ["python3", "-m", "src.surgery.train_qwen_qwen", "--output-dir=/app/outputs_qwen_hybrid", "--batch-size", "1", "--gradient-accumulation", "32", "--learning-rate", "5e-4", "--num-epochs", "3", "--use-8bit-adam"]

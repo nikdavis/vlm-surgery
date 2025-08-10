@@ -22,13 +22,14 @@ class ParquetCaptionAdapter:
     Parquet files using PyArrow's lazy loading capabilities.
     """
     
-    def __init__(self, file_glob: str, base_path: Optional[str] = None):
+    def __init__(self, file_glob: str, base_path: Optional[str] = None, preload_all: bool = True):
         """
         Initialize the adapter with a glob pattern for Parquet files.
         
         Args:
             file_glob: Glob pattern for Parquet files (e.g., "data-captions/part-*.parquet")
             base_path: Optional base path to prepend to file_glob
+            preload_all: If True, load all files into memory at startup (default: True)
         """
         if base_path:
             full_pattern = str(Path(base_path) / file_glob)
@@ -52,6 +53,66 @@ class ParquetCaptionAdapter:
         # Get schema information
         self.schema = self.arrow_dataset.schema
         logger.debug(f"Dataset schema: {self.schema}")
+        
+        # Initialize file cache for loaded Parquet tables
+        self._file_cache = {}  # file_idx -> pyarrow.Table
+        self.preload_all = preload_all
+        
+        # Preload all files if requested
+        if self.preload_all:
+            self._preload_all_files()
+    
+    def _preload_all_files(self):
+        """Preload all Parquet files into memory."""
+        import pyarrow.parquet as pq
+        import time
+        
+        logger.info(f"Preloading {len(self.files)} Parquet files into memory...")
+        total_size = 0
+        start_time = time.time()
+        
+        for i, file_path in enumerate(self.files):
+            file_start = time.time()
+            table = pq.read_table(file_path)
+            self._file_cache[i] = table
+            
+            # Estimate memory usage
+            size_mb = table.nbytes / (1024 * 1024)
+            total_size += size_mb
+            
+            logger.info(f"  Loaded file {i+1}/{len(self.files)}: {Path(file_path).name} ({size_mb:.1f} MB) in {time.time() - file_start:.1f}s")
+        
+        elapsed = time.time() - start_time
+        logger.info(f"✓ All files preloaded: {total_size:.1f} MB total in {elapsed:.1f}s")
+    
+    def _build_index_mapping(self):
+        """Build mapping from global index to (file_index, local_index)."""
+        import pyarrow.parquet as pq
+        self._file_indices = []
+        cumulative = 0
+        
+        if self.preload_all:
+            # Use cached tables for row counts
+            for i in range(len(self.files)):
+                num_rows = len(self._file_cache[i])
+                self._file_indices.append((cumulative, cumulative + num_rows))
+                cumulative += num_rows
+        else:
+            # Read metadata for row counts
+            for i, file_path in enumerate(self.files):
+                metadata = pq.read_metadata(file_path)
+                num_rows = metadata.num_rows
+                self._file_indices.append((cumulative, cumulative + num_rows))
+                cumulative += num_rows
+        
+        logger.debug(f"Built index mapping for {len(self.files)} files")
+    
+    def _get_file_and_local_index(self, global_idx: int) -> tuple[int, int]:
+        """Convert global index to (file_index, local_index within file)."""
+        for file_idx, (start, end) in enumerate(self._file_indices):
+            if start <= global_idx < end:
+                return file_idx, global_idx - start
+        raise IndexError(f"Global index {global_idx} out of range")
     
     def __len__(self) -> int:
         """Returns the total number of items in the dataset."""
@@ -73,12 +134,31 @@ class ParquetCaptionAdapter:
         if index < 0 or index >= self._real_length:
             raise IndexError(f"Index {index} out of range [0, {self._real_length})")
         
-        # Use scanner to efficiently fetch just one row
-        scanner = self.arrow_dataset.scanner()
-        batch = scanner.take([index])
+        # For efficient random access, we need to map indices to files
+        if not hasattr(self, '_file_indices'):
+            # Build index mapping on first access
+            self._build_index_mapping()
+        
+        # Find which file contains this index
+        file_idx, local_idx = self._get_file_and_local_index(index)
+        
+        # Get the table (either preloaded or load on demand)
+        if self.preload_all:
+            # Use preloaded table
+            table = self._file_cache[file_idx]
+        else:
+            # Load on demand (fallback for low memory systems)
+            import pyarrow.parquet as pq
+            if file_idx not in self._file_cache:
+                logger.debug(f"Loading Parquet file {file_idx} on demand...")
+                self._file_cache[file_idx] = pq.read_table(self.files[file_idx])
+            table = self._file_cache[file_idx]
+        
+        # Get the specific row
+        row = table.slice(local_idx, 1)
         
         # Convert to Python dictionary
-        row_dict = batch.to_pydict()
+        row_dict = row.to_pydict()
         
         # Extract values (each field is a list with one item)
         sample = {}
