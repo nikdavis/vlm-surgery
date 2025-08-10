@@ -222,6 +222,7 @@ class VirtualDataset(Dataset):
             
             # Format output for collator
             with logfire.span('format_output'):
+                # For caption datasets: put caption in assistant slot, minimal prompt in user
                 output = {
                     "images": [sample["image"]],  # PIL image in a list
                     "messages": [
@@ -229,13 +230,13 @@ class VirtualDataset(Dataset):
                             "role": "user",
                             "content": [
                                 {"type": "image"},
-                                {"type": "text", "text": sample["prompts"][0]}  # Use first caption
+                                {"type": "text", "text": "Describe this image."}  # Minimal prompt
                             ]
                         },
                         {
                             "role": "assistant",
                             "content": [
-                                {"type": "text", "text": ""}  # Empty response for caption training
+                                {"type": "text", "text": sample["prompts"][0]}  # Caption goes here for training
                             ]
                         }
                     ]

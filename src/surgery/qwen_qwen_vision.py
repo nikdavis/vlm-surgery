@@ -423,19 +423,33 @@ class QwenQwenHybrid(nn.Module):
                 denom = torch.zeros((), device=hidden.device, dtype=torch.long)
                 chunk = 256
                 
-                with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                    for s in range(0, T, chunk):
-                        e = min(T, s + chunk)
+                # Bulletproof loss for text-only path
+                def chunked_causal_ce(hidden, labels, W, chunk=256):
+                    B, T, D = hidden.shape
+                    loss_sum = None
+                    valid = 0
+                    
+                    for s in range(0, T-1, chunk):
+                        e = min(T-1, s+chunk)
                         h = hidden[:, s:e, :].reshape(-1, D)
-                        y = labels[:, s:e].reshape(-1)
-                        logits_slice = h @ W.t()
-                        loss_slice = torch.nn.functional.cross_entropy(
-                            logits_slice, y, ignore_index=-100, reduction="sum"
-                        )
-                        loss_sum += loss_slice
-                        denom += (y != -100).sum()
+                        y = labels[:, s+1:e+1].reshape(-1)
+                        m = (y != -100)
+                        if not m.any():
+                            continue
+                        yy = y.clone().masked_fill(~m, 0)
+                        logits = h @ W.t()
+                        vec = torch.nn.functional.cross_entropy(logits, yy, reduction="none")
+                        cur = (vec * m).sum()
+                        loss_sum = cur if loss_sum is None else (loss_sum + cur)
+                        valid += int(m.sum().item())
+                    
+                    if loss_sum is None:
+                        # Return a zero with grad path
+                        return hidden[..., :1].sum() * 0.0
+                    return loss_sum / max(valid, 1)
                 
-                loss = loss_sum / torch.clamp(denom, min=1)
+                with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                    loss = chunked_causal_ce(hidden, labels, W, chunk=256)
                 from transformers.modeling_outputs import CausalLMOutputWithPast
                 return CausalLMOutputWithPast(loss=loss)
             
@@ -646,23 +660,67 @@ class QwenQwenHybrid(nn.Module):
         if padded_labels is not None:
             W = self.language_model.lm_head.weight  # [V, D]
             B, T, D = hidden.shape
-            loss_sum = hidden.new_zeros(())
-            denom = torch.zeros((), device=hidden.device, dtype=torch.long)
-            chunk = 256  # Process in chunks to save memory
+            
+            # Detailed sanity check
+            lbl0 = (padded_labels != -100).sum().item()
+            lbl1 = (padded_labels[:, 1:] != -100).sum().item()
+            logger.info(f"[sanity] B={B} T={T} valid(before shift)={lbl0} valid(after shift)={lbl1}")
+            
+            # Quick CE comparison to detect current vs next token prediction
+            def quick_ce(h, y, chunk=256):
+                tot = h.new_zeros(())
+                den = torch.zeros((), device=h.device, dtype=torch.long)
+                for s in range(0, h.size(1), chunk):
+                    e = min(h.size(1), s+chunk)
+                    h2 = h[:, s:e, :].reshape(-1, h.size(-1))
+                    y2 = y[:, s:e].reshape(-1)
+                    m = (y2 != -100)
+                    if m.any():
+                        # safer masking than ignore_index
+                        yy = y2.clone().masked_fill(~m, 0)
+                        logits = h2 @ W.t()
+                        vec = torch.nn.functional.cross_entropy(logits, yy, reduction="none")
+                        tot += (vec * m).sum()
+                        den += m.sum()
+                return tot / torch.clamp(den, min=1)
+            
+            # Check if we're accidentally predicting current token
+            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                ce_curr = quick_ce(hidden, padded_labels, 256)
+                ce_next = quick_ce(hidden[:, :-1, :], padded_labels[:, 1:], 256)
+            logger.info(f"[sanity] ce_curr={ce_curr.item():.3f}  ce_next={ce_next.item():.3f}")
+            
+            # Bulletproof chunked causal CE with explicit masking
+            def chunked_causal_ce(hidden, labels, W, chunk=256):
+                # hidden [B,T,D], labels [B,T], W [V,D]
+                B, T, D = hidden.shape
+                loss_sum = None
+                valid = 0
+                
+                for s in range(0, T-1, chunk):
+                    e = min(T-1, s+chunk)
+                    h = hidden[:, s:e, :].reshape(-1, D)          # predicts s+1..e+1
+                    y = labels[:, s+1:e+1].reshape(-1)            # shifted targets
+                    m = (y != -100)
+                    if not m.any():
+                        continue
+                    yy = y.clone().masked_fill(~m, 0)
+                    logits = h @ W.t()                            # [N,V], bf16
+                    vec = torch.nn.functional.cross_entropy(logits, yy, reduction="none")
+                    cur = (vec * m).sum()                         # tensor with grad
+                    loss_sum = cur if loss_sum is None else (loss_sum + cur)
+                    valid += int(m.sum().item())
+                
+                if loss_sum is None:
+                    # Return a zero that still has a grad path, to avoid Trainer crash
+                    return hidden[..., :1].sum() * 0.0
+                return loss_sum / max(valid, 1)
             
             with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                for s in range(0, T, chunk):
-                    e = min(T, s + chunk)
-                    h = hidden[:, s:e, :].reshape(-1, D)  # [B*chunk, D]
-                    y = padded_labels[:, s:e].reshape(-1)  # [B*chunk]
-                    logits_slice = h @ W.t()  # [B*chunk, V], bf16 - only this chunk in memory
-                    loss_slice = torch.nn.functional.cross_entropy(
-                        logits_slice, y, ignore_index=-100, reduction="sum"
-                    )
-                    loss_sum += loss_slice
-                    denom += (y != -100).sum()
+                loss = chunked_causal_ce(hidden, padded_labels, W, chunk=256)
             
-            loss = loss_sum / torch.clamp(denom, min=1)
+            # Log actual returned loss value
+            logger.info(f"[ACTUAL LOSS] Returning loss={loss.item():.4f} to Trainer (sample {self._debug_loss_counter})")
             
             if self._debug_loss_counter < 5:
                 logger.debug(f"  Output loss: {loss.item() if loss is not None else 'None'}")

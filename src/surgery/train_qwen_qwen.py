@@ -176,7 +176,7 @@ class CoTDataCollator:
             messages_for_processor,
             padding=False,  # We'll pad after inserting vision tokens
             truncation=True,
-            max_length=768,  # Reduced to save memory
+            max_length=2048,  # Increased to 2k tokens
             return_tensors=None  # Get list format first
         )
 
@@ -234,35 +234,115 @@ class CoTDataCollator:
 
             image_idx += num_images
 
-        # Now pad sequences
-        input_ids = torch.nn.utils.rnn.pad_sequence(modified_input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id)
+        # --- REPLACED: Deterministic sequence build so labels are correct ---
+        
+        # Token IDs we need
+        user_role_id = 151669  # <｜User｜>
+        assistant_role_id = 151670  # <｜Assistant｜>
+        im_end_id = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
+        image_pad_id = self.placeholder_id
+        
+        max_len = 2048  # Using the 2k limit
+        
+        seq_ids_list = []
+        labels_list = []
+        
+        for feature in features:
+            num_images = len(feature["images"])
+            
+            # Extract prompt and response text
+            user_content = feature["messages"][0]["content"]
+            prompt_txt = next((item["text"] for item in user_content if item["type"] == "text"), "")
+            resp_txt = feature["messages"][1]["content"][0]["text"] if feature["messages"][1]["content"] else ""
+            
+            # Safety check: if assistant is still empty for some reason, use a fallback
+            if not resp_txt or not resp_txt.strip():
+                logger.warning(f"Empty assistant response found, using fallback")
+                resp_txt = "This image shows various visual elements."  # Fallback response
+            
+            # Plain tokenization (no chat template)
+            prompt_ids = self.tokenizer(prompt_txt, add_special_tokens=False).input_ids
+            resp_ids = self.tokenizer(resp_txt, add_special_tokens=False).input_ids
+            
+            # Log response length once
+            if not hasattr(self, '_resp_len_logged'):
+                logger.info(f"[collator] response_token_len={len(resp_ids)}")
+                self._resp_len_logged = True
+            
+            # Build: [User] [<image_pad> * num_images] prompt [Assistant] response [<im_end>]
+            seq = [user_role_id] + [image_pad_id] * num_images + prompt_ids + [assistant_role_id] + resp_ids + [im_end_id]
+            
+            # Fit to max_len: *always* keep the full assistant; trim prompt from the left if needed
+            overflow = max(0, len(seq) - max_len)
+            if overflow > 0:
+                # How many can we cut from the prompt slice (between pads and assistant token)?
+                cut_zone_start = 1 + num_images
+                cut_zone_end = cut_zone_start + len(prompt_ids)
+                cut = min(overflow, len(prompt_ids))
+                if cut > 0:
+                    # Drop from the left of the prompt window
+                    seq = seq[:cut_zone_start] + seq[cut_zone_start + cut:]
+                    logger.debug(f"Trimmed {cut} tokens from prompt to fit max_len")
+            
+            # Create labels: only the assistant response tokens should be targets
+            # Find the assistant_role position -> response starts right after it
+            try:
+                a_pos = seq.index(assistant_role_id)
+            except ValueError:
+                a_pos = len(seq)  # fallback (shouldn't happen)
+            r_start = a_pos + 1
+            
+            # Response ends before <|im_end|>
+            try:
+                r_end = seq.index(im_end_id, r_start)
+            except ValueError:
+                r_end = len(seq)
+            
+            labels = torch.full((len(seq),), -100, dtype=torch.long)
+            
+            # Copy the actual target ids for response span (mask specials just in case)
+            for j in range(r_start, r_end):
+                tok = seq[j]
+                if tok not in (user_role_id, assistant_role_id, image_pad_id, im_end_id, self.tokenizer.pad_token_id):
+                    labels[j] = tok
+            
+            # Debug first few samples
+            if len(seq_ids_list) < 2 and not hasattr(self, '_seq_debug_logged'):
+                logger.info(f"Sample {len(seq_ids_list)} sequence build:")
+                logger.info(f"  Total sequence length: {len(seq)}")
+                logger.info(f"  Assistant response position: {r_start}-{r_end}")
+                logger.info(f"  Response length: {r_end - r_start} tokens")
+                logger.info(f"  Unmasked tokens: {(labels != -100).sum().item()}")
+                if r_end > r_start:
+                    # Show what we're training on
+                    resp_preview = self.tokenizer.decode(seq[r_start:min(r_end, r_start+20)])
+                    logger.info(f"  Training on (first 20 tokens): '{resp_preview}...'")
+            
+            seq_ids_list.append(torch.tensor(seq, dtype=torch.long))
+            labels_list.append(labels)
+        
+        if len(seq_ids_list) > 0 and not hasattr(self, '_seq_debug_logged'):
+            self._seq_debug_logged = True
+        
+        # Now pad everything
+        input_ids = torch.nn.utils.rnn.pad_sequence(seq_ids_list, batch_first=True, padding_value=self.tokenizer.pad_token_id)
         attention_mask = torch.nn.utils.rnn.pad_sequence(
-            [torch.ones_like(ids) for ids in modified_input_ids],
-            batch_first=True,
+            [torch.ones_like(x) for x in seq_ids_list], 
+            batch_first=True, 
             padding_value=0
         )
-
-        # Debug: Check if vision tokens were inserted
-        if not hasattr(self, '_debug_printed'):
-            self._debug_printed = True
-            logger.info("Collator Summary:")
-            logger.info(f"  Placeholder id (image_pad): {self.placeholder_id}")
-            logger.info(f"  Vision start id: {vision_start_id}")
-            logger.info(f"  Vision end id: {vision_end_id}")
-            logger.info(f"  Total images processed: {image_idx}")
-            for i in range(min(2, input_ids.shape[0])):  # Check first 2 samples
-                num_placeholders = (input_ids[i] == self.placeholder_id).sum().item()
-                num_vision_start = (input_ids[i] == vision_start_id).sum().item()
-                num_vision_end = (input_ids[i] == vision_end_id).sum().item()
-                logger.info(f"  Sample {i}: {num_placeholders} image_pad, {num_vision_start} vision_start, {num_vision_end} vision_end")
-                # Show actual token sequence around placeholders
-                if num_placeholders > 0:
-                    placeholder_pos = (input_ids[i] == self.placeholder_id).nonzero(as_tuple=True)[0][0].item()
-                    start = max(0, placeholder_pos - 5)
-                    end = min(len(input_ids[i]), placeholder_pos + 5)
-                    token_window = input_ids[i][start:end].tolist()
-                    logger.info(f"    Token window around placeholder: {token_window}")
-            self._insertion_logged = True  # Mark that we've logged insertion
+        labels = torch.nn.utils.rnn.pad_sequence(labels_list, batch_first=True, padding_value=-100)
+        
+        # Sanity check
+        if not hasattr(self, '_labels_final_logged'):
+            valid_before = (labels != -100).sum().item()
+            valid_after = (labels[:, 1:] != -100).sum().item() if labels.shape[1] > 1 else 0
+            logger.info(f"[labels] valid(before shift)={valid_before}  valid(after shift)={valid_after}")
+            if valid_after < 10:
+                logger.warning("⚠️ Still very few tokens for training!")
+            else:
+                logger.info(f"✓ Good: {valid_after} tokens for training")
+            self._labels_final_logged = True
 
         # Process images
         image_outputs = {}
@@ -270,122 +350,6 @@ class CoTDataCollator:
             image_inputs = self.image_processor(images, return_tensors="pt")
             image_outputs = image_inputs
 
-        labels = input_ids.clone()
-
-        # Create the masked labels - mask everything before assistant response
-        for i in range(len(features)):
-            input_id_list = input_ids[i].tolist()
-
-            # Qwen3 uses <|im_start|>assistant format
-            assistant_prompt = self.tokenizer.encode("<|im_start|>assistant\n", add_special_tokens=False)
-            assistant_pos = None
-
-            # Debug: Log what we're looking for vs what we have (only for first few samples)
-            if i < 2 and not hasattr(self, '_assistant_debug_logged'):
-                logger.info(f"Sample {i} assistant token search:")
-                logger.info(f"  Looking for tokens: {assistant_prompt}")
-                logger.info(f"  Total tokens in sample: {len(input_id_list)}")
-                logger.info(f"  First 20 tokens: {input_id_list[:20]}")
-                # Check if assistant tokens exist anywhere
-                assistant_found = False
-                for j in range(len(input_id_list) - len(assistant_prompt) + 1):
-                    if all(input_id_list[j + k] == assistant_prompt[k] for k in range(len(assistant_prompt))):
-                        assistant_found = True
-                        logger.info(f"  ✓ Found assistant tokens at position {j}")
-                        # Show context around it
-                        context_start = max(0, j - 10)
-                        context_end = min(len(input_id_list), j + 20)
-                        context_text = self.tokenizer.decode(input_id_list[context_start:context_end])
-                        logger.info(f"  Context: ...{context_text}...")
-                        break
-                if not assistant_found:
-                    logger.warning(f"  ✗ Assistant tokens NOT found in sample!")
-                    # Show the full decoded text to debug
-                    full_text = self.tokenizer.decode(input_id_list)
-                    logger.info(f"  Full text (first 500 chars): {full_text[:500]}")
-                self._assistant_debug_logged = True
-
-            if len(assistant_prompt) > 0:
-                # Find this sequence in the input
-                for j in range(len(input_id_list) - len(assistant_prompt) + 1):
-                    if all(input_id_list[j + k] == assistant_prompt[k] for k in range(len(assistant_prompt))):
-                        assistant_pos = j + len(assistant_prompt)
-                        break
-
-            # Try alternative patterns if standard pattern not found
-            if assistant_pos is None:
-                # Try pattern 2: <｜Assistant｜> (DeepSeek R1 style)
-                assistant_token_id = 151670  # <｜Assistant｜> token
-                for j in range(len(input_id_list)):
-                    if input_id_list[j] == assistant_token_id:
-                        assistant_pos = j + 1  # Position after the assistant token
-                        if i < 2:
-                            logger.info(f"  Found assistant token 151670 at position {j}")
-                        break
-
-            # Try pattern 3: Look for "assistant" in any form
-            if assistant_pos is None:
-                # Encode just "assistant" and look for it
-                assistant_variants = [
-                    self.tokenizer.encode("assistant", add_special_tokens=False),
-                    self.tokenizer.encode("Assistant", add_special_tokens=False),
-                    self.tokenizer.encode("\nassistant", add_special_tokens=False),
-                ]
-                for variant in assistant_variants:
-                    if len(variant) > 0:
-                        for j in range(len(input_id_list) - len(variant) + 1):
-                            if all(input_id_list[j + k] == variant[k] for k in range(len(variant))):
-                                assistant_pos = j + len(variant)
-                                if i < 2:
-                                    logger.info(f"  Found assistant variant at position {j}")
-                                break
-                        if assistant_pos is not None:
-                            break
-
-            if assistant_pos is not None:
-                # Mask everything before assistant response (user prompt and assistant marker)
-                labels[i, :assistant_pos] = -100
-                # Only log for first batch to reduce spam
-                if i < 2 and not hasattr(self, '_mask_logged'):
-                    masked_count = assistant_pos
-                    total_count = (labels[i] != self.tokenizer.pad_token_id).sum().item()
-                    logger.info(f"  Sample {i}: Masked {masked_count} tokens before assistant response, {total_count - masked_count} tokens remain for training")
-                    self._mask_logged = True
-            else:
-                # Only log occasionally to reduce spam
-                if not hasattr(self, '_assistant_not_found_count'):
-                    self._assistant_not_found_count = 0
-                self._assistant_not_found_count += 1
-                if self._assistant_not_found_count <= 3:  # Only log first 3 times
-                    logger.warning(f"Could not find assistant token in sample {i} - will train on full sequence")
-                    # Show what we have
-                    if i == 0:
-                        decoded = self.tokenizer.decode(input_id_list[:200])
-                        logger.info(f"  First 200 chars: {decoded[:200]}")
-                # As fallback, mask just the user prompt portion
-                # Look for where the image_pad token is and mask up to there plus a bit
-                if self.placeholder_id in input_id_list:
-                    pad_idx = input_id_list.index(self.placeholder_id)
-                    # Mask up to and including the placeholder + some context
-                    labels[i, :pad_idx+10] = -100  # Mask user prompt + a bit of context
-
-        # Mask padding tokens
-        labels[labels == self.tokenizer.pad_token_id] = -100
-
-        # Debug: Check label masking
-        if not hasattr(self, '_label_debug_printed'):
-            self._label_debug_printed = True
-            logger.info("Label masking:")
-            for i in range(min(2, labels.shape[0])):
-                non_masked = (labels[i] != -100).sum().item()
-                total = (labels[i] != self.tokenizer.pad_token_id).sum().item()  # Don't count padding
-                logger.info(f"  Sample {i}: {non_masked}/{total} non-padded tokens are unmasked ({non_masked/total*100:.1f}% if total > 0 else 0)")
-                # Show first few non-masked tokens
-                non_masked_indices = (labels[i] != -100).nonzero(as_tuple=True)[0]
-                if len(non_masked_indices) > 0:
-                    first_tokens = labels[i][non_masked_indices[:10]].tolist()
-                    decoded = [self.tokenizer.decode([t]) for t in first_tokens]
-                    logger.info(f"    First non-masked tokens: {decoded}")
 
         # Combine everything
         result = {
