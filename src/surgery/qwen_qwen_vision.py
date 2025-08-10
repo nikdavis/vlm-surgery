@@ -83,16 +83,21 @@ class QwenQwenHybrid(nn.Module):
         class DtypeWrapper(nn.Module):
             def __init__(self, in_dim, out_dim):
                 super().__init__()
+                # Add pre-LayerNorm for stability
+                self.pre_ln = nn.LayerNorm(in_dim)
                 # Use fp32 for stability
                 self.linear = nn.Linear(in_dim, out_dim, bias=True, dtype=torch.float32)
-                # Initialize with smaller std for stability
-                nn.init.normal_(self.linear.weight, mean=0.0, std=0.02)
+                # ZERO-INIT for safety - adapter starts "off"
+                nn.init.zeros_(self.linear.weight)
                 nn.init.zeros_(self.linear.bias)
 
             def forward(self, x):
                 # Convert input to fp32, process, convert back to input dtype
                 orig_dtype = x.dtype
                 x = x.to(torch.float32)
+                x = self.pre_ln(x)  # Pre-normalize
+                # Guard against bad upstream values
+                x = torch.clamp(x, -10.0, 10.0)
                 x = self.linear(x)
                 x = x.to(orig_dtype)
                 return x
@@ -214,8 +219,9 @@ class QwenQwenHybrid(nn.Module):
         self.vision_model.merger.mlp[0].bias.requires_grad = True
         # Layer 1 is GELU, no parameters
         # Layer 2: Our replaced DtypeWrapper(5120 -> 2560)
-        self.vision_model.merger.mlp[2].linear.weight.requires_grad = True
-        self.vision_model.merger.mlp[2].linear.bias.requires_grad = True
+        # Make sure both pre_ln and linear are trainable
+        for param in self.vision_model.merger.mlp[2].parameters():
+            param.requires_grad = True
 
         # Freeze language model completely
         for param in self.language_model.parameters():
@@ -587,9 +593,8 @@ class QwenQwenHybrid(nn.Module):
         lora_path = path / "lora_adapter"
         if lora_path.exists():
             from peft import PeftModel
-            # Need to load on top of the base model, not the already-peft model
-            base_model = model.language_model.base_model.model if hasattr(model.language_model, 'base_model') else model.language_model
-            model.language_model = PeftModel.from_pretrained(base_model, str(lora_path))
+            # We're not using LoRA in this setup, so just use the language model directly
+            model.language_model = PeftModel.from_pretrained(model.language_model, str(lora_path))
             logger.info(f"Loaded LoRA adapter from {lora_path}")
 
         logger.info(f"Loaded hybrid model from {model_directory}")

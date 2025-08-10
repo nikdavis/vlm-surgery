@@ -5,7 +5,7 @@ This script uses gradient checkpointing to save memory.
 """
 from pathlib import Path
 import torch
-from transformers import Trainer, TrainingArguments, AutoTokenizer, AutoProcessor, TrainerCallback
+from transformers import Trainer, TrainingArguments, AutoTokenizer, AutoProcessor, TrainerCallback, SchedulerType
 from transformers.optimization import Adafactor, AdafactorSchedule
 from typing import List, Dict, Any, Optional
 import click
@@ -353,43 +353,46 @@ class PercentCurriculum(TrainerCallback):
         self.ramp_end_pct = ramp_end_pct
         self.total_updates = None
 
-    def on_step_end(self, args, state, control, model=None, **kwargs):
-        # Model is passed directly, not in kwargs
-        if model is None:
-            return control
-            
-        # Initialize total updates based on state/args
-        if self.total_updates is None:
-            if state.max_steps and state.max_steps > 0:
-                self.total_updates = state.max_steps
-            else:
-                # Estimate from epochs and dataset size
-                # This is approximate since we don't have direct access to dataloader
-                self.total_updates = int(args.num_train_epochs * 100)  # Rough estimate
+    def on_train_begin(self, args, state, control, **kwargs):
+        """Compute true total updates once at the start."""
+        # Prefer explicit max_steps
+        if state.max_steps and state.max_steps > 0:
+            self.total_updates = state.max_steps
+        else:
+            trainer = kwargs.get("trainer")
+            if trainer:
+                ga = args.gradient_accumulation_steps
+                updates_per_epoch = ceil(len(trainer.get_train_dataloader()) / ga)
+                epochs = int(args.num_train_epochs)
+                self.total_updates = max(1, updates_per_epoch * epochs)
         
-        t = state.global_step
-        T = max(1, self.total_updates)
-        p = min(1.0, t / T)  # progress 0..1
+        if self.total_updates:
+            logger.info(f"Curriculum: total_updates={self.total_updates}, stages at {int(self.stage1_pct*100)}% and {int(self.ramp_end_pct*100)}%")
+
+    def on_step_end(self, args, state, control, model=None, **kwargs):
+        """Adjust curriculum parameters based on progress."""
+        if model is None or self.total_updates is None:
+            return control
+        
+        p = min(1.0, state.global_step / self.total_updates)
 
         # Stage 1: keep extras off
         if p <= self.stage1_pct:
             model.base_k = self.start_k
-            if hasattr(model, "use_soft_gate") and model.use_soft_gate:
+            if getattr(model, "use_soft_gate", False):
                 with torch.no_grad():
                     model.extra_gate.data.fill_(0.0)
             return control
 
         # Stage 2: ramp K and gate (cosine ramp)
-        ramp_p = (p - self.stage1_pct) / max(1e-6, (self.ramp_end_pct - self.stage1_pct))
-        ramp_p = max(0.0, min(1.0, ramp_p))
-        # cosine 0→1: smooth
-        smooth = 0.5 * (1 - cos(pi * ramp_p))
-        K = int(round(self.start_k + smooth * (self.end_k - self.start_k)))
-        model.base_k = K
-        if hasattr(model, "use_soft_gate") and model.use_soft_gate:
-            g = smooth * self.gate_max
+        ramp = max(0.0, min(1.0, (p - self.stage1_pct) / (self.ramp_end_pct - self.stage1_pct + 1e-6)))
+        smooth = 0.5 * (1 - cos(pi * ramp))
+        model.base_k = int(round(self.start_k + smooth * (self.end_k - self.start_k)))
+        
+        if getattr(model, "use_soft_gate", False):
             with torch.no_grad():
-                model.extra_gate.data.fill_(g)
+                model.extra_gate.data.fill_(smooth * self.gate_max)
+        
         return control
 
 @click.command()
@@ -397,13 +400,14 @@ class PercentCurriculum(TrainerCallback):
 @click.option("--data-path", default="./datasetv2/combined_dataset.json", help="Path to the unified dataset JSON file.")
 @click.option("--batch-size", type=int, default=1, help="Training batch size per device.")
 @click.option("--gradient-accumulation", type=int, default=32, help="Gradient accumulation steps.")
-@click.option("--learning-rate", type=float, default=2e-5, help="Learning rate for the adapter.")
+@click.option("--learning-rate", type=float, default=5e-4, help="Learning rate for the adapter (default 5e-4 for stability).")
 @click.option("--num-epochs", type=int, default=3, help="Number of training epochs.")
+@click.option("--max-steps", type=int, default=None, help="Max training steps (overrides num-epochs if set).")
 @click.option("--use-8bit-adam", is_flag=True, help="Use 8-bit Adam optimizer instead of AdaFactor")
 @click.option("--exclude-v1-data/--include-v1-data", default=True, help="Exclude/include v1 data (test_data_200 examples)")
 @click.option("--exclude-captions/--include-captions", default=False, help="Exclude/include captions dataset")
 @click.option("--quick-test", is_flag=True, help="Quick test mode: 10 examples, no accumulation, eval at step 1")
-def main(output_dir, data_path, batch_size, gradient_accumulation, learning_rate, num_epochs, use_8bit_adam, exclude_v1_data, exclude_captions, quick_test):
+def main(output_dir, data_path, batch_size, gradient_accumulation, learning_rate, num_epochs, max_steps, use_8bit_adam, exclude_v1_data, exclude_captions, quick_test):
     # Quick test mode overrides
     if quick_test:
         logger.info("🚀 QUICK TEST MODE - Minimal training for validation")
@@ -521,34 +525,54 @@ def main(output_dir, data_path, batch_size, gradient_accumulation, learning_rate
         optimizer = "adafactor"
         logger.info("Using AdaFactor optimizer")
     
-    # 3. Define TrainingArguments (simple, single-GPU version)
+    # 3. Define TrainingArguments with better defaults
+    # Use max_steps if provided, otherwise epochs
+    if max_steps and not quick_test:
+        training_steps = max_steps
+        training_epochs = 1  # Ignored when max_steps > 0
+        logger.info(f"Training for {max_steps} steps")
+    else:
+        training_steps = -1 if not quick_test else 5  # Quick test: 5 steps
+        training_epochs = num_epochs
+        if not quick_test:
+            logger.info(f"Training for {num_epochs} epochs")
+    
     training_args = TrainingArguments(
         output_dir=str(output_dir),
         per_device_train_batch_size=batch_size,
         per_device_eval_batch_size=1,  # Keep eval batch size at 1 to avoid OOM
         gradient_accumulation_steps=gradient_accumulation,
         eval_accumulation_steps=4,  # Process eval data in chunks of 4 to avoid OOM
+        # Duration control
+        max_steps=training_steps,
+        num_train_epochs=training_epochs,
+        # LR & schedule
         learning_rate=learning_rate,
-        num_train_epochs=num_epochs,
-        bf16=True, # Use bfloat16 for memory efficiency
-        fp16=False, # BF16 is better than FP16 for stability
-        logging_steps=5,
-        save_strategy="steps",
-        save_steps=20,  # Save every 20 steps
-        save_safetensors=False,  # Disable safetensors to avoid shared tensor issues
+        lr_scheduler_type=SchedulerType.COSINE,  # Cosine schedule
+        warmup_ratio=0.1 if not quick_test else 0.0,  # 10% warmup (skip in quick test)
+        # Precision
+        bf16=True,
+        fp16=False,
+        # Logging & checkpointing
+        logging_steps=10 if not quick_test else 1,  # Log every 10 steps
         eval_strategy="steps",
-        eval_steps=20,  # Evaluate every 20 steps
+        eval_steps=25 if not quick_test else 1,  # Eval every 25 steps
+        save_strategy="steps",
+        save_steps=25 if not quick_test else 1,  # Save every 25 steps
+        save_safetensors=False,  # Disable safetensors to avoid shared tensor issues
+        # Training config
         do_train=True,
         do_eval=True,
         remove_unused_columns=False,
-        gradient_checkpointing=True, # Enable for memory but we'll customize it
+        gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
-        optim=optimizer,  # Use chosen optimizer
-        report_to="mlflow",  # Enable MLflow logging
+        max_grad_norm=1.0,
+        dataloader_num_workers=2,  # Use 2 workers for better IO
+        # Optimizer
+        optim=optimizer,
+        # Reporting
+        report_to="mlflow" if not quick_test else "none",
         run_name=run_name,
-        max_grad_norm=1.0,  # Standard gradient clipping
-        warmup_ratio=0.1,  # 10% warmup is more stable than fixed steps
-        dataloader_num_workers=0,  # Disable multiprocessing to save memory
     )
 
     # The Trainer will handle gradient checkpointing based on training_args
