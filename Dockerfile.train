@@ -43,6 +43,12 @@ RUN pip install --no-cache-dir --break-system-packages \
     "timm" \
     "einops"
 
+# Install Flash Attention 2 (build from source for compatibility)
+# MAX_JOBS limits parallel compilation to avoid OOM during build
+RUN MAX_JOBS=4 pip install --no-cache-dir --break-system-packages \
+    --no-build-isolation \
+    flash-attn>=2.5.8
+
 
 # Default command to run the Qwen-Qwen hybrid training with virtual dataset
 # This makes it easy to see available options when running the container

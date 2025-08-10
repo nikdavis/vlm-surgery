@@ -176,7 +176,7 @@ class CoTDataCollator:
             messages_for_processor,
             padding=False,  # We'll pad after inserting vision tokens
             truncation=True,
-            max_length=1024,  # Increased to ensure we capture assistant response
+            max_length=768,  # Reduced to save memory
             return_tensors=None  # Get list format first
         )
 

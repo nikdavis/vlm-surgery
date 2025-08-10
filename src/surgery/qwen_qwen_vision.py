@@ -52,18 +52,58 @@ class QwenQwenHybrid(nn.Module):
         # Configure 8-bit quantization for QLoRA
         bnb_config = BitsAndBytesConfig(
             load_in_8bit=True,
-            bnb_8bit_compute_dtype=torch.float16,  # Compute in fp16
+            bnb_8bit_compute_dtype=torch.bfloat16,  # Use bf16 to avoid casts
             # For 8-bit, we don't use nf4 (that's for 4-bit)
         )
 
+        # Robust Flash Attention enablement
+        from transformers.utils import is_flash_attn_2_available
+        
+        flash_ok = False
+        try:
+            flash_ok = is_flash_attn_2_available()
+        except Exception:
+            pass
+        
+        extra_load_kwargs = {}
+        if flash_ok:
+            # Newer HF: pass at load
+            extra_load_kwargs["attn_implementation"] = "flash_attention_2"
+            logger.info("Flash Attention 2 available, enabling...")
+        else:
+            logger.info("Flash Attention 2 not available, using SDPA (still efficient)")
+        
         # Load model in 8-bit for memory efficiency (but no LoRA)
         self.language_model = AutoModelForCausalLM.from_pretrained(
             language_model_name,
             quantization_config=bnb_config,
             device_map="auto",  # Needed for 8-bit
-            torch_dtype=torch.float16,
+            torch_dtype=torch.bfloat16,  # Use bf16 to avoid casts
+            **extra_load_kwargs,
         )
-
+        
+        # Post-load: set whichever attribute exists
+        if flash_ok:
+            for obj in (self.language_model.config, getattr(self.language_model, "model", None)):
+                if obj is None:
+                    continue
+                if hasattr(obj, "attn_implementation"):
+                    setattr(obj, "attn_implementation", "flash_attention_2")
+                elif hasattr(obj, "_attn_implementation"):
+                    setattr(obj, "_attn_implementation", "flash_attention_2")
+        
+        # Enable PyTorch SDPA kernels as fallback
+        import torch.backends.cuda as cuda
+        cuda.sdp_kernel(enable_flash=True, enable_math=True, enable_mem_efficient=True)
+        
+        # Safe logging (won't crash if attribute name differs)
+        attn_impl = (
+            getattr(self.language_model.config, "attn_implementation", None)
+            or getattr(self.language_model.config, "_attn_implementation", None)
+            or "sdpa/auto"
+        )
+        logger.info(f"Attention implementation: {attn_impl}")
+        
         self.tokenizer = AutoTokenizer.from_pretrained(language_model_name)
         self.r1_hidden_dim = self.language_model.config.hidden_size
 
@@ -92,9 +132,9 @@ class QwenQwenHybrid(nn.Module):
                 nn.init.zeros_(self.linear.bias)
 
             def forward(self, x):
-                # Convert input to fp32, process, convert back to input dtype
+                # Keep in bf16 for efficiency
                 orig_dtype = x.dtype
-                x = x.to(torch.float32)
+                x = x.to(torch.bfloat16)
                 x = self.pre_ln(x)  # Pre-normalize
                 # Guard against bad upstream values
                 x = torch.clamp(x, -10.0, 10.0)
@@ -302,15 +342,15 @@ class QwenQwenHybrid(nn.Module):
         # through it to reach our trainable merger projection
         # This is CRITICAL - no_grad breaks training completely!
 
-        # Disable autocast to keep everything in fp32
-        with torch.amp.autocast('cuda', enabled=False):
+        # Use bf16 for vision path to save memory
+        with torch.cuda.amp.autocast(dtype=torch.bfloat16):
             # Use the vision model's forward method
             # Skip pre-norm due to Qwen2.5-VL's special block requirements
             # The post-projection LayerNorm will provide stability
             vision_features = self.vision_model(pixel_values, grid_thw=image_grid_thw)
 
-        # Convert to float32 to match our replaced layer
-        vision_features = vision_features.to(dtype=torch.float32)
+        # Keep in bf16 for memory efficiency
+        vision_features = vision_features.to(dtype=torch.bfloat16)
 
         # Clip vision features to prevent extreme values
         vision_features = torch.clamp(vision_features, min=-10.0, max=10.0)
@@ -364,7 +404,43 @@ class QwenQwenHybrid(nn.Module):
         #         print(f"  image_grid_thw shape: {image_grid_thw.shape}")
 
         if pixel_values is None:
-            return self.language_model(inputs_embeds=text_embeddings, attention_mask=attention_mask, labels=labels, **kwargs)
+            # Text-only path: use same body-only + chunked CE approach
+            body = self.language_model.model
+            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                body_out = body(
+                    inputs_embeds=text_embeddings,
+                    attention_mask=attention_mask,
+                    use_cache=False,
+                    output_hidden_states=False,
+                    return_dict=True,
+                )
+                hidden = body_out.last_hidden_state
+            
+            if labels is not None:
+                W = self.language_model.lm_head.weight
+                B, T, D = hidden.shape
+                loss_sum = hidden.new_zeros(())
+                denom = torch.zeros((), device=hidden.device, dtype=torch.long)
+                chunk = 256
+                
+                with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                    for s in range(0, T, chunk):
+                        e = min(T, s + chunk)
+                        h = hidden[:, s:e, :].reshape(-1, D)
+                        y = labels[:, s:e].reshape(-1)
+                        logits_slice = h @ W.t()
+                        loss_slice = torch.nn.functional.cross_entropy(
+                            logits_slice, y, ignore_index=-100, reduction="sum"
+                        )
+                        loss_sum += loss_slice
+                        denom += (y != -100).sum()
+                
+                loss = loss_sum / torch.clamp(denom, min=1)
+                from transformers.modeling_outputs import CausalLMOutputWithPast
+                return CausalLMOutputWithPast(loss=loss)
+            
+            from transformers.modeling_outputs import CausalLMOutputWithPast
+            return CausalLMOutputWithPast(last_hidden_state=hidden)
 
         # Avoid stale cache during evaluation (eval typically passes labels)
         if (not self.training) and (labels is not None):
@@ -436,21 +512,30 @@ class QwenQwenHybrid(nn.Module):
             # Get the vision embeddings for this sample
             vis = vision_embeds_list[i]  # [T, D] projected+LN'd
 
-            # ===== Token curriculum =====
-            # Build: [global, base_k pooled tokens, extra tokens (gated)]
+            # ===== Token curriculum with hard cap =====
+            max_vision_tokens = 128  # Hard cap to save memory
+            
+            # Build: [global, base_k pooled tokens, optional extra tokens]
             global_tok = self._global_token(vis)  # [1, D]
-            base_pooled = self._resample_tokens(vis, k=self.base_k)  # [base_k, D]
-
-            # Extra tokens are the original tokens (all of them since no max)
-            extra_tokens = vis  # Use all tokens
-
-            if self.use_soft_gate:
-                gated_extra = torch.tanh(self.extra_gate) * extra_tokens
+            base_k = min(self.base_k, max_vision_tokens - 1)  # Leave room for global token
+            base_pooled = self._resample_tokens(vis, k=base_k)  # [base_k, D]
+            
+            # Only use extra tokens if curriculum allows and we have budget
+            use_extras = self.training and getattr(self, "allow_extra_tokens", False)
+            if use_extras:
+                extra_budget = max_vision_tokens - (1 + base_pooled.shape[0])
+                if extra_budget > 0:
+                    # Sample extra tokens evenly from the vision features
+                    idx = torch.linspace(0, vis.shape[0] - 1, steps=extra_budget, device=vis.device).long()
+                    extra_tokens = vis.index_select(0, idx)
+                    if self.use_soft_gate:
+                        extra_tokens = torch.tanh(self.extra_gate) * extra_tokens
+                    vision_embeds = torch.cat([global_tok, base_pooled, extra_tokens], dim=0)
+                else:
+                    vision_embeds = torch.cat([global_tok, base_pooled], dim=0)
             else:
-                # Hard Stage-1 off
-                gated_extra = extra_tokens * 0.0
-
-            vision_embeds = torch.cat([global_tok, base_pooled, gated_extra], dim=0)  # [1+K+T, D]
+                # No extras - just global + base pooled
+                vision_embeds = torch.cat([global_tok, base_pooled], dim=0)
             # =============================
 
             # Debug vision embedding - commented out now that it's working
@@ -541,23 +626,56 @@ class QwenQwenHybrid(nn.Module):
             embed_mean = padded_embeds.abs().mean().item()
             logger.debug(f"  Embeddings: has_nan={has_nan}, has_inf={has_inf}, max={embed_max:.4f}, mean={embed_mean:.4f}")
 
-        output = self.language_model(
-            inputs_embeds=padded_embeds, attention_mask=padded_mask,
-            labels=padded_labels, **kwargs
-        )
-
-        if self._debug_loss_counter < 5 and hasattr(output, 'loss'):
-            logger.debug(f"  Output loss: {output.loss.item() if output.loss is not None else 'None'}")
-            if output.loss is not None and torch.isnan(output.loss):
-                logger.error(f"Loss is NaN!")
-                # Check logits
-                if hasattr(output, 'logits'):
-                    logits_max = output.logits.abs().max().item()
-                    logits_has_nan = torch.isnan(output.logits).any().item()
-                    logits_has_inf = torch.isinf(output.logits).any().item()
-                    logger.error(f"  Logits: has_nan={logits_has_nan}, has_inf={logits_has_inf}, max={logits_max:.4f}")
-
-        return output
+        # Log sequence stats for debugging
+        B, T, D = padded_embeds.shape
+        logger.debug(f"[seq stats] B={B}, T={T}, D={D} (vision<=128, text<=768 expected)")
+        
+        # Run only the transformer body (not the full LM with lm_head)
+        body = self.language_model.model  # Qwen3Model inside the CausalLM
+        with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+            body_out = body(
+                inputs_embeds=padded_embeds,
+                attention_mask=padded_mask,
+                use_cache=False,
+                output_hidden_states=False,
+                return_dict=True,
+            )
+            hidden = body_out.last_hidden_state  # [B, T, D], bf16
+        
+        # Compute loss without materializing full logits
+        if padded_labels is not None:
+            W = self.language_model.lm_head.weight  # [V, D]
+            B, T, D = hidden.shape
+            loss_sum = hidden.new_zeros(())
+            denom = torch.zeros((), device=hidden.device, dtype=torch.long)
+            chunk = 256  # Process in chunks to save memory
+            
+            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                for s in range(0, T, chunk):
+                    e = min(T, s + chunk)
+                    h = hidden[:, s:e, :].reshape(-1, D)  # [B*chunk, D]
+                    y = padded_labels[:, s:e].reshape(-1)  # [B*chunk]
+                    logits_slice = h @ W.t()  # [B*chunk, V], bf16 - only this chunk in memory
+                    loss_slice = torch.nn.functional.cross_entropy(
+                        logits_slice, y, ignore_index=-100, reduction="sum"
+                    )
+                    loss_sum += loss_slice
+                    denom += (y != -100).sum()
+            
+            loss = loss_sum / torch.clamp(denom, min=1)
+            
+            if self._debug_loss_counter < 5:
+                logger.debug(f"  Output loss: {loss.item() if loss is not None else 'None'}")
+                if loss is not None and torch.isnan(loss):
+                    logger.error(f"Loss is NaN!")
+            
+            # Return ONLY loss during training (no logits to save memory)
+            from transformers.modeling_outputs import CausalLMOutputWithPast
+            return CausalLMOutputWithPast(loss=loss)
+        
+        # Inference/eval: return hidden states (avoid materializing logits)
+        from transformers.modeling_outputs import CausalLMOutputWithPast
+        return CausalLMOutputWithPast(last_hidden_state=hidden)
 
     def save_pretrained(self, save_directory: str):
         path = Path(save_directory)
