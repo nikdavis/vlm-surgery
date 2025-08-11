@@ -37,13 +37,13 @@ class AdapterOnlyTrainer(Trainer):
     """Custom trainer that only saves the adapter weights, not the full model."""
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
-        """Override save to only save merger MLP weights using the model's save_pretrained method."""
+        """Override save to only save adapter weights (merger MLP, post_proj_ln, extra_gate) using the model's save_pretrained method."""
         output_dir = output_dir if output_dir is not None else self.args.output_dir
         os.makedirs(output_dir, exist_ok=True)
 
-        logger.info(f"Saving merger MLP weights to {output_dir}")
+        logger.info(f"Saving adapter weights (merger MLP, post_proj_ln, extra_gate) to {output_dir}")
 
-        # Use the model's custom save_pretrained method which only saves merger weights
+        # Use the model's custom save_pretrained method which saves all adapter components
         if hasattr(self.model, 'save_pretrained'):
             self.model.save_pretrained(output_dir)
         else:
@@ -58,7 +58,7 @@ class AdapterOnlyTrainer(Trainer):
         with open(os.path.join(output_dir, 'training_args.json'), 'w') as f:
             json.dump(self.args.to_dict(), f, indent=2)
 
-        logger.info(f"Merger MLP checkpoint saved successfully")
+        logger.info(f"Adapter checkpoint saved successfully")
     
     def _load_from_checkpoint(self, checkpoint: str):
         """Override to properly load our adapter-only checkpoints."""
@@ -76,6 +76,26 @@ class AdapterOnlyTrainer(Trainer):
             self.model.vision_model.merger.load_state_dict(state["vision_merger_state"])
             self.model.vision_start_embedding.data.copy_(state["vision_start_embedding"].data)
             self.model.vision_end_embedding.data.copy_(state["vision_end_embedding"].data)
+            
+            # Restore post_proj_ln if present (backward compatibility)
+            if "post_proj_ln_state" in state:
+                self.model.post_proj_ln.load_state_dict(state["post_proj_ln_state"])
+                logger.info("✓ post_proj_ln restored")
+            else:
+                logger.warning("post_proj_ln_state missing in checkpoint - using fresh initialization (expect loss spike)")
+            
+            # Restore extra_gate if present (backward compatibility)
+            if "extra_gate" in state:
+                self.model.extra_gate.data.copy_(state["extra_gate"].data)
+                logger.info(f"✓ extra_gate restored (value={state['extra_gate'].item():.3f})")
+            else:
+                logger.warning("extra_gate missing in checkpoint - using fresh initialization")
+            
+            # Log sanity check values after loading
+            logger.info(f"Checkpoint loaded: post_proj_ln gamma mean={self.model.post_proj_ln.weight.mean().item():.4f}, "
+                       f"beta mean={self.model.post_proj_ln.bias.mean().item():.4f}, "
+                       f"extra_gate={self.model.extra_gate.item():.3f}")
+            
             logger.info("✓ Adapter weights restored")
             
             # Restore optimizer if present
@@ -96,13 +116,21 @@ class AdapterOnlyTrainer(Trainer):
                 self._load_rng_state(checkpoint)
                 logger.info("✓ RNG state restored")
             
-            # Restore trainer state
+            # Restore trainer state but RESET history to avoid polluted running averages
             trainer_state_path = os.path.join(checkpoint, "trainer_state.json")
             if os.path.exists(trainer_state_path):
                 from transformers.trainer_callback import TrainerState
                 self.state = TrainerState.load_from_json(trainer_state_path)
+                
+                # CRITICAL: Reset log history to clear stale running averages from before fixes
+                # This prevents misleading high train_loss values from old spikes
+                old_global_step = self.state.global_step
+                self.state.log_history = []  # Clear all history
+                self.state.best_metric = None  # Reset best metric tracking
+                # Keep important state like global_step and max_steps
+                
                 self.control = self.callback_handler.on_train_begin(self.args, self.state, self.control)
-                logger.info(f"✓ Trainer state restored (global_step={self.state.global_step})")
+                logger.info(f"✓ Trainer state partially restored (global_step={self.state.global_step}, history cleared)")
             
             # Stop memory tracker and return (skip default weight loading)
             if hasattr(self, '_memory_tracker') and self._memory_tracker is not None:
@@ -219,14 +247,14 @@ class CoTDataCollator:
             num_images = len(feature["images"])
             image_pad_tokens = [self.placeholder_id] * num_images
 
-            # Debug: Show where we're inserting (only for first batch)
-            if i < 2 and not hasattr(self, '_insertion_logged'):  # First 2 samples, first batch only
-                tokens_before = self.tokenizer.decode(input_ids[:insert_pos])
-                tokens_after = self.tokenizer.decode(input_ids[insert_pos:insert_pos+50])  # First 50 chars after
-                logger.info(f"Sample {i} insertion:")
-                logger.info(f"  Inserting {num_images} image_pad tokens at position {insert_pos}")
-                logger.info(f"  Text before: ...{tokens_before[-50:]}")
-                logger.info(f"  Text after: {tokens_after}...")
+            # Debug: Show where we're inserting (only for first batch) - commented out for cleaner output
+            # if i < 2 and not hasattr(self, '_insertion_logged'):  # First 2 samples, first batch only
+            #     tokens_before = self.tokenizer.decode(input_ids[:insert_pos])
+            #     tokens_after = self.tokenizer.decode(input_ids[insert_pos:insert_pos+50])  # First 50 chars after
+            #     logger.debug(f"Sample {i} insertion:")
+            #     logger.debug(f"  Inserting {num_images} image_pad tokens at position {insert_pos}")
+            #     logger.debug(f"  Text before: ...{tokens_before[-50:]}")
+            #     logger.debug(f"  Text after: {tokens_after}...")
 
             # Insert only the image_pad tokens
             new_ids = input_ids[:insert_pos] + image_pad_tokens + input_ids[insert_pos:]

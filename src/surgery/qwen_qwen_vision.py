@@ -302,17 +302,24 @@ class QwenQwenHybrid(nn.Module):
         return vis_tokens.mean(dim=0, keepdim=True)  # [1, D]
 
     def get_trainable_parameters(self):
-        """Return all trainable parameters (entire merger MLP + markers)."""
+        """Return all trainable parameters (entire merger MLP + markers + post_proj_ln + extra_gate)."""
         trainable_params = []
 
         # Get ALL merger MLP parameters
         # Layer 0
         trainable_params.extend([self.vision_model.merger.mlp[0].weight, self.vision_model.merger.mlp[0].bias])
-        # Layer 2 (our replaced layer)
-        trainable_params.extend([self.vision_model.merger.mlp[2].linear.weight, self.vision_model.merger.mlp[2].linear.bias])
+        # Layer 2 (our replaced layer) - includes pre_ln parameters
+        for param in self.vision_model.merger.mlp[2].parameters():
+            trainable_params.append(param)
 
         # Add marker embeddings
         trainable_params.extend([self.vision_start_embedding, self.vision_end_embedding])
+        
+        # Add post-projection LayerNorm parameters
+        trainable_params.extend([self.post_proj_ln.weight, self.post_proj_ln.bias])
+        
+        # Add curriculum gate
+        trainable_params.append(self.extra_gate)
 
         return trainable_params
 
@@ -404,57 +411,23 @@ class QwenQwenHybrid(nn.Module):
         #         print(f"  image_grid_thw shape: {image_grid_thw.shape}")
 
         if pixel_values is None:
-            # Text-only path: use same body-only + chunked CE approach
-            body = self.language_model.model
+            # Text-only path: use standard language model forward pass
             with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                body_out = body(
+                outputs = self.language_model(
                     inputs_embeds=text_embeddings,
                     attention_mask=attention_mask,
+                    labels=labels,
                     use_cache=False,
                     output_hidden_states=False,
                     return_dict=True,
                 )
-                hidden = body_out.last_hidden_state
             
-            if labels is not None:
-                W = self.language_model.lm_head.weight
-                B, T, D = hidden.shape
-                loss_sum = hidden.new_zeros(())
-                denom = torch.zeros((), device=hidden.device, dtype=torch.long)
-                chunk = 256
-                
-                # Bulletproof loss for text-only path
-                def chunked_causal_ce(hidden, labels, W, chunk=256):
-                    B, T, D = hidden.shape
-                    loss_sum = None
-                    valid = 0
-                    
-                    for s in range(0, T-1, chunk):
-                        e = min(T-1, s+chunk)
-                        h = hidden[:, s:e, :].reshape(-1, D)
-                        y = labels[:, s+1:e+1].reshape(-1)
-                        m = (y != -100)
-                        if not m.any():
-                            continue
-                        yy = y.clone().masked_fill(~m, 0)
-                        logits = h @ W.t()
-                        vec = torch.nn.functional.cross_entropy(logits, yy, reduction="none")
-                        cur = (vec * m).sum()
-                        loss_sum = cur if loss_sum is None else (loss_sum + cur)
-                        valid += int(m.sum().item())
-                    
-                    if loss_sum is None:
-                        # Return a zero with grad path
-                        return hidden[..., :1].sum() * 0.0
-                    return loss_sum / max(valid, 1)
-                
-                with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                    loss = chunked_causal_ce(hidden, labels, W, chunk=256)
-                from transformers.modeling_outputs import CausalLMOutputWithPast
-                return CausalLMOutputWithPast(loss=loss)
+            # Log text-only loss for debugging - commented out for cleaner output
+            # if labels is not None and outputs.loss is not None:
+            #     valid_tokens = (labels != -100).sum().item()
+            #     logger.debug(f"[TEXT-ONLY LOSS] HF loss={outputs.loss.item():.4f}, valid_tokens={valid_tokens}")
             
-            from transformers.modeling_outputs import CausalLMOutputWithPast
-            return CausalLMOutputWithPast(last_hidden_state=hidden)
+            return outputs
 
         # Avoid stale cache during evaluation (eval typically passes labels)
         if (not self.training) and (labels is not None):
@@ -640,118 +613,48 @@ class QwenQwenHybrid(nn.Module):
             embed_mean = padded_embeds.abs().mean().item()
             logger.debug(f"  Embeddings: has_nan={has_nan}, has_inf={has_inf}, max={embed_max:.4f}, mean={embed_mean:.4f}")
 
-        # Log sequence stats for debugging
+        # Log sequence stats for debugging - commented out for cleaner output
         B, T, D = padded_embeds.shape
-        logger.debug(f"[seq stats] B={B}, T={T}, D={D} (vision<=128, text<=768 expected)")
+        # logger.debug(f"[seq stats] B={B}, T={T}, D={D} (vision<=128, text<=768 expected)")
         
-        # Run only the transformer body (not the full LM with lm_head)
-        body = self.language_model.model  # Qwen3Model inside the CausalLM
+        # Use the standard language model forward pass with Flash Attention
+        # This will compute loss internally using the standard HF implementation
         with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-            body_out = body(
+            outputs = self.language_model(
                 inputs_embeds=padded_embeds,
                 attention_mask=padded_mask,
+                labels=padded_labels,
                 use_cache=False,
                 output_hidden_states=False,
                 return_dict=True,
             )
-            hidden = body_out.last_hidden_state  # [B, T, D], bf16
         
-        # Compute loss without materializing full logits
-        if padded_labels is not None:
-            W = self.language_model.lm_head.weight  # [V, D]
-            B, T, D = hidden.shape
-            
-            # Detailed sanity check
-            lbl0 = (padded_labels != -100).sum().item()
-            lbl1 = (padded_labels[:, 1:] != -100).sum().item()
-            logger.info(f"[sanity] B={B} T={T} valid(before shift)={lbl0} valid(after shift)={lbl1}")
-            
-            # Quick CE comparison to detect current vs next token prediction
-            def quick_ce(h, y, chunk=256):
-                tot = h.new_zeros(())
-                den = torch.zeros((), device=h.device, dtype=torch.long)
-                for s in range(0, h.size(1), chunk):
-                    e = min(h.size(1), s+chunk)
-                    h2 = h[:, s:e, :].reshape(-1, h.size(-1))
-                    y2 = y[:, s:e].reshape(-1)
-                    m = (y2 != -100)
-                    if m.any():
-                        # safer masking than ignore_index
-                        yy = y2.clone().masked_fill(~m, 0)
-                        logits = h2 @ W.t()
-                        vec = torch.nn.functional.cross_entropy(logits, yy, reduction="none")
-                        tot += (vec * m).sum()
-                        den += m.sum()
-                return tot / torch.clamp(den, min=1)
-            
-            # Check if we're accidentally predicting current token
-            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                ce_curr = quick_ce(hidden, padded_labels, 256)
-                ce_next = quick_ce(hidden[:, :-1, :], padded_labels[:, 1:], 256)
-            logger.info(f"[sanity] ce_curr={ce_curr.item():.3f}  ce_next={ce_next.item():.3f}")
-            
-            # Bulletproof chunked causal CE with explicit masking
-            def chunked_causal_ce(hidden, labels, W, chunk=256):
-                # hidden [B,T,D], labels [B,T], W [V,D]
-                B, T, D = hidden.shape
-                loss_sum = None
-                valid = 0
-                
-                for s in range(0, T-1, chunk):
-                    e = min(T-1, s+chunk)
-                    h = hidden[:, s:e, :].reshape(-1, D)          # predicts s+1..e+1
-                    y = labels[:, s+1:e+1].reshape(-1)            # shifted targets
-                    m = (y != -100)
-                    if not m.any():
-                        continue
-                    yy = y.clone().masked_fill(~m, 0)
-                    logits = h @ W.t()                            # [N,V], bf16
-                    vec = torch.nn.functional.cross_entropy(logits, yy, reduction="none")
-                    cur = (vec * m).sum()                         # tensor with grad
-                    loss_sum = cur if loss_sum is None else (loss_sum + cur)
-                    valid += int(m.sum().item())
-                
-                if loss_sum is None:
-                    # Return a zero that still has a grad path, to avoid Trainer crash
-                    return hidden[..., :1].sum() * 0.0
-                return loss_sum / max(valid, 1)
-            
-            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                loss = chunked_causal_ce(hidden, padded_labels, W, chunk=256)
-            
-            # Log actual returned loss value
-            logger.info(f"[ACTUAL LOSS] Returning loss={loss.item():.4f} to Trainer (sample {self._debug_loss_counter})")
-            
-            if self._debug_loss_counter < 5:
-                logger.debug(f"  Output loss: {loss.item() if loss is not None else 'None'}")
-                if loss is not None and torch.isnan(loss):
-                    logger.error(f"Loss is NaN!")
-            
-            # Return ONLY loss during training (no logits to save memory)
-            from transformers.modeling_outputs import CausalLMOutputWithPast
-            return CausalLMOutputWithPast(loss=loss)
+        # Log the loss value for debugging - commented out for cleaner output
+        # if padded_labels is not None and outputs.loss is not None:
+        #     valid_tokens = (padded_labels != -100).sum().item()
+        #     logger.debug(f"[LOSS] HF loss={outputs.loss.item():.4f}, valid_tokens={valid_tokens}")
         
-        # Inference/eval: return hidden states (avoid materializing logits)
-        from transformers.modeling_outputs import CausalLMOutputWithPast
-        return CausalLMOutputWithPast(last_hidden_state=hidden)
+        return outputs
 
     def save_pretrained(self, save_directory: str):
         path = Path(save_directory)
         path.mkdir(parents=True, exist_ok=True)
         with open(path / "adapter_config.json", "w") as f:
             json.dump(self.config.to_dict(), f, indent=2)
-        # Save trainable state dict (only merger MLP layers)
+        # Save trainable state dict (merger MLP layers + post_proj_ln + extra_gate)
         trainable_state_dict = {
             'vision_merger_state': self.vision_model.merger.state_dict(),
             'vision_start_embedding': self.vision_start_embedding,
             'vision_end_embedding': self.vision_end_embedding,
+            'post_proj_ln_state': self.post_proj_ln.state_dict(),  # Save LayerNorm
+            'extra_gate': self.extra_gate,  # Save curriculum gate
         }
         torch.save(trainable_state_dict, path / "vision_adapter.pt")
 
         # No LoRA to save - language model is frozen
 
         self.tokenizer.save_pretrained(save_directory)
-        logger.info(f"Merger MLP weights saved to {save_directory}")
+        logger.info(f"Merger MLP weights, post_proj_ln, and extra_gate saved to {save_directory}")
 
     @classmethod
     def from_pretrained(cls, model_directory: str):
@@ -760,10 +663,29 @@ class QwenQwenHybrid(nn.Module):
             config = json.load(f)
         model = cls(config.get('vision_model_name'), config.get('language_model_name'))
         # Load saved weights
-        adapter_state = torch.load(path / "vision_adapter.pt")
+        adapter_state = torch.load(path / "vision_adapter.pt", map_location="cpu")
         model.vision_model.merger.load_state_dict(adapter_state['vision_merger_state'])
-        model.vision_start_embedding.data = adapter_state['vision_start_embedding'].data
-        model.vision_end_embedding.data = adapter_state['vision_end_embedding'].data
+        model.vision_start_embedding.data.copy_(adapter_state['vision_start_embedding'].data)
+        model.vision_end_embedding.data.copy_(adapter_state['vision_end_embedding'].data)
+        
+        # Load post_proj_ln if present (backward compatibility)
+        if 'post_proj_ln_state' in adapter_state:
+            model.post_proj_ln.load_state_dict(adapter_state['post_proj_ln_state'])
+            logger.info(f"Loaded post_proj_ln from checkpoint")
+        else:
+            logger.warning("post_proj_ln_state missing in checkpoint - using fresh initialization (expect loss spike)")
+        
+        # Load extra_gate if present (backward compatibility)  
+        if 'extra_gate' in adapter_state:
+            model.extra_gate.data.copy_(adapter_state['extra_gate'].data)
+            logger.info(f"Loaded extra_gate={adapter_state['extra_gate'].item():.3f} from checkpoint")
+        else:
+            logger.warning("extra_gate missing in checkpoint - using fresh initialization")
+        
+        # Log sanity check values
+        logger.info(f"post_proj_ln gamma mean={model.post_proj_ln.weight.mean().item():.4f}")
+        logger.info(f"post_proj_ln beta mean={model.post_proj_ln.bias.mean().item():.4f}")
+        logger.info(f"extra_gate={model.extra_gate.item():.3f}")
 
         # Load LoRA adapter if it exists
         lora_path = path / "lora_adapter"

@@ -14,11 +14,13 @@ from torch.utils.data import Dataset
 import time
 import os
 import logfire
+import random
 
 # Initialize Logfire for performance tracking
 logfire_token = os.getenv('LOGFIRE_TOKEN')
 if logfire_token:
-    logfire.configure(token=logfire_token, service_name='virtual-dataset')
+    # Disable inspect_arguments to avoid introspection warnings during eval
+    logfire.configure(token=logfire_token, service_name='virtual-dataset', inspect_arguments=False)
     logger.info("Logfire instrumentation enabled for VirtualDataset")
 
 from .protocols import SourceAdapter, Transform
@@ -198,7 +200,7 @@ class VirtualDataset(Dataset):
                 adapter_start = time.time()
                 sample = self.adapter.get_canonical_sample(int(real_idx))
                 adapter_time = time.time() - adapter_start
-                logfire.info(f"Loaded sample from Parquet in {adapter_time:.3f}s", adapter_time_ms=adapter_time*1000)
+                # logfire.debug(f"Loaded sample from Parquet in {adapter_time:.3f}s", adapter_time_ms=adapter_time*1000)
             
             # Apply transforms
             if self.transform_pipeline:
@@ -218,11 +220,26 @@ class VirtualDataset(Dataset):
                     sample.pop('__force_identity__', None)
                     
                     transform_time = time.time() - transform_start
-                    logfire.info(f"Applied transforms in {transform_time:.3f}s", transform_time_ms=transform_time*1000)
+                    # logfire.debug(f"Applied transforms in {transform_time:.3f}s", transform_time_ms=transform_time*1000)
             
             # Format output for collator
             with logfire.span('format_output'):
                 # For caption datasets: put caption in assistant slot, minimal prompt in user
+                # Use varied prompts for training diversity (caption-appropriate)
+                caption_prompts = [
+                    "Please generate a caption for this image.",
+                    "Write a caption for this image.",
+                    "What's shown in this image?",
+                    "Describe what you see.",
+                    "Caption this image.",
+                    "What does this image show?",
+                    "Provide a caption."
+                ]
+                
+                # Randomly select a prompt for training diversity
+                # (eval uses the base prompt for fair comparison)
+                prompt = random.choice(caption_prompts) if self.training else "Please generate a caption for this image."
+                
                 output = {
                     "images": [sample["image"]],  # PIL image in a list
                     "messages": [
@@ -230,7 +247,7 @@ class VirtualDataset(Dataset):
                             "role": "user",
                             "content": [
                                 {"type": "image"},
-                                {"type": "text", "text": "Describe this image."}  # Minimal prompt
+                                {"type": "text", "text": prompt}
                             ]
                         },
                         {
@@ -243,12 +260,12 @@ class VirtualDataset(Dataset):
                 }
             
             total_time = time.time() - start_time
-            logfire.info(
-                f"{phase}: Generated sample {index} in {total_time:.3f}s",
-                total_time_ms=total_time*1000,
-                phase=phase,
-                index=index
-            )
+            # logfire.debug(
+            #     f"{phase}: Generated sample {index} in {total_time:.3f}s",
+            #     total_time_ms=total_time*1000,
+            #     phase=phase,
+            #     index=index
+            # )
             
             return output
 
