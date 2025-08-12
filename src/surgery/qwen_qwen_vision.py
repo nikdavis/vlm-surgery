@@ -387,7 +387,7 @@ class QwenQwenHybrid(nn.Module):
 
         # Disable autocast for vision path to ensure numerical stability
         # The DtypeWrapper already handles fp32 conversion where needed
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast('cuda', enabled=False):
             # Use the vision model's forward method
             # Skip pre-norm due to Qwen2.5-VL's special block requirements
             # The post-projection LayerNorm will provide stability
@@ -427,8 +427,29 @@ class QwenQwenHybrid(nn.Module):
     def forward(self, input_ids: torch.Tensor, pixel_values: Optional[torch.Tensor] = None,
                 image_grid_thw: Optional[torch.Tensor] = None,
                 labels: Optional[torch.Tensor] = None,
-                attention_mask: Optional[torch.Tensor] = None, **kwargs):
+                attention_mask: Optional[torch.Tensor] = None,
+                past_key_values: Optional[tuple] = None,
+                use_cache: Optional[bool] = None,
+                **kwargs):
 
+        # === Decoding Phase (KV Cache Hit) ===
+        # If we have a cache, we bypass vision processing and embedding merging.
+        if past_key_values is not None:
+            # We are decoding. input_ids should typically be just the last token [B, 1].
+            # Use the language model directly.
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                outputs = self.language_model(
+                    input_ids=input_ids,  # Only the last token
+                    attention_mask=attention_mask,
+                    labels=labels,
+                    past_key_values=past_key_values,
+                    use_cache=use_cache,
+                    output_hidden_states=False,
+                    return_dict=True,
+                )
+            return outputs
+
+        # === Prefill Phase (or Training) ===
         # Use get_input_embeddings to ensure we get the right embedding layer
         text_embeddings = self.language_model.get_input_embeddings()(input_ids)
 
@@ -449,12 +470,12 @@ class QwenQwenHybrid(nn.Module):
 
         if pixel_values is None:
             # Text-only path: use standard language model forward pass
-            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                 outputs = self.language_model(
                     inputs_embeds=text_embeddings,
                     attention_mask=attention_mask,
                     labels=labels,
-                    use_cache=False,
+                    use_cache=use_cache if use_cache is not None else False,
                     output_hidden_states=False,
                     return_dict=True,
                 )
@@ -668,12 +689,12 @@ class QwenQwenHybrid(nn.Module):
         
         # Use the standard language model forward pass with Flash Attention
         # This will compute loss internally using the standard HF implementation
-        with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
             outputs = self.language_model(
                 inputs_embeds=padded_embeds,
                 attention_mask=padded_mask,
                 labels=padded_labels,
-                use_cache=False,
+                use_cache=use_cache if use_cache is not None else False,
                 output_hidden_states=False,
                 return_dict=True,
             )

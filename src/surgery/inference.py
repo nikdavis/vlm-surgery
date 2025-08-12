@@ -71,10 +71,10 @@ def _extract_assistant_span(full_text: str) -> str:
 @click.option("--prompt", default="Please describe this image.", type=str, help="User prompt")
 @click.option("--caption", is_flag=True, help="Use caption prompt")
 @click.option("--system", default=system_prompt)
-@click.option("--max-tokens", default=128, type=int)
-@click.option("--num-shots", default=10, type=int, help="Number of independent generations to produce.")
-@click.option("--temperature", default=0.4, type=float)
-@click.option("--top-p", default=0.9, type=float)
+@click.option("--max-tokens", default=400, type=int)
+@click.option("--num-shots", default=1, type=int, help="Number of independent generations to produce.")
+@click.option("--temperature", default=0.3, type=float)
+@click.option("--top-p", default=0.95, type=float)
 @click.option("--do-sample/--no-sample", default=True)
 def main(checkpoint, image, prompt, caption, system, max_tokens, num_shots, temperature, top_p, do_sample):
     logger.remove()
@@ -140,21 +140,34 @@ def main(checkpoint, image, prompt, caption, system, max_tokens, num_shots, temp
         if num_shots > 1:
             logger.info(f"\n--- Shot {i+1}/{num_shots} ---\n")
 
-        input_ids = initial_input_ids.clone()
-        attn = initial_attn.clone()
+        # Initialize state for KV caching
+        past_key_values = None
+        # Initialize inputs for the prefill phase (step 0)
+        current_input_ids = initial_input_ids.clone()
+        current_attn_mask = initial_attn.clone()
+        current_pixel_values = pixel_values
+        current_image_grid_thw = image_grid_thw
+
+        # We will store the full sequence (prompt + generated) here
+        full_input_ids = initial_input_ids.clone()
 
         with torch.inference_mode():
             for step in range(max_tokens):
+                # 1. Model Forward Pass
+                # In decoding (step > 0), current_input_ids is just the last generated token.
                 out = model(
-                    input_ids=input_ids,
-                    attention_mask=attn,
-                    pixel_values=pixel_values,
-                    image_grid_thw=image_grid_thw,
+                    input_ids=current_input_ids,
+                    attention_mask=current_attn_mask,
+                    pixel_values=current_pixel_values,
+                    image_grid_thw=current_image_grid_thw,
                     labels=None,
+                    past_key_values=past_key_values,
+                    use_cache=True
                 )
                 logits = out.logits if hasattr(out, "logits") else out
                 next_logits = logits[:, -1, :]  # [B,V]
 
+                # 2. Sampling (Keep existing sampling logic)
                 if do_sample:
                     # temperature + top-p
                     temp = temperature
@@ -177,14 +190,48 @@ def main(checkpoint, image, prompt, caption, system, max_tokens, num_shots, temp
                 else:
                     next_token = torch.argmax(next_logits, dim=-1, keepdim=True)  # [B,1]
 
-                input_ids = torch.cat([input_ids, next_token], dim=1)
-                attn = torch.ones_like(input_ids, device=input_ids.device)
+                # 3. Update the full sequence
+                full_input_ids = torch.cat([full_input_ids, next_token], dim=1)
 
+                # 4. Check stop conditions
                 tid = int(next_token.item())
                 if tid in stop_ids:
                     break
 
-        decoded = tok.decode(input_ids[0], skip_special_tokens=False)
+                # 5. Prepare for next iteration (KV Caching Logic)
+                past_key_values = out.past_key_values
+                current_input_ids = next_token  # Next input is just the last token
+
+                # CRITICAL: Update Attention Mask for Multimodal Inputs
+                if step == 0:
+                    # After prefill (step 0), the internal sequence length expands because
+                    # the vision tokens were injected inside model.forward().
+                    # We must update the attention mask to reflect this true internal length.
+                    if past_key_values is None or len(past_key_values) == 0:
+                        raise RuntimeError("Model did not return past_key_values after prefill step.")
+
+                    # Infer the true length from the KV cache shape.
+                    # Shape is typically [Batch, Heads, SeqLen, Dim]. Qwen uses index 2 for SeqLen.
+                    prefill_len = past_key_values[0][0].shape[2]
+
+                    # Initialize the mask to the true internal length
+                    current_attn_mask = torch.ones(
+                        (initial_input_ids.shape[0], prefill_len),
+                        device=initial_input_ids.device, dtype=initial_attn.dtype
+                    )
+
+                    # After prefill, we don't pass images anymore.
+                    current_pixel_values = None
+                    current_image_grid_thw = None
+
+                # Extend the mask by 1 for the newly generated token
+                current_attn_mask = torch.cat([
+                    current_attn_mask,
+                    torch.ones((current_attn_mask.shape[0], 1), device=current_attn_mask.device, dtype=current_attn_mask.dtype)
+                ], dim=1)
+
+        # Decode the full sequence (including prompt)
+        decoded = tok.decode(full_input_ids[0], skip_special_tokens=False)
         assistant = _extract_assistant_span(decoded)
         print(assistant.strip())
 
