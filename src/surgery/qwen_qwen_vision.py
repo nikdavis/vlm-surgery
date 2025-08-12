@@ -1,8 +1,11 @@
 import os
 import torch
 import torch.nn as nn
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoModel, BitsAndBytesConfig
-from typing import Optional
+from transformers import (
+    AutoModelForCausalLM, AutoTokenizer, AutoModel, BitsAndBytesConfig,
+    PreTrainedModel, PretrainedConfig, AutoConfig
+)
+from typing import Optional, Tuple
 from pathlib import Path
 import json
 from loguru import logger
@@ -14,25 +17,60 @@ from peft import LoraConfig, get_peft_model, TaskType, prepare_model_for_kbit_tr
 #     - merger.mlp.1: GELU()
 #     - merger.mlp.2: Linear(5120 → 3584)
 
-class QwenQwenHybrid(nn.Module):
+# === Define Configuration Class ===
+class QwenQwenHybridConfig(PretrainedConfig):
+    model_type = "qwen_qwen_hybrid"  # Unique identifier for AutoModel registration
+
+    def __init__(
+        self,
+        vision_model_name="Qwen/Qwen2.5-VL-7B-Instruct",
+        language_model_name="Qwen/Qwen3-4B",
+        disable_pooling=True,
+        # These will be populated during model initialization
+        vision_placeholder_id=None,
+        vision_start_token_id=None,
+        vision_end_token_id=None,
+        **kwargs,
+    ):
+        self.vision_model_name = vision_model_name
+        self.language_model_name = language_model_name
+        self.disable_pooling = disable_pooling
+        self.vision_placeholder_id = vision_placeholder_id
+        self.vision_start_token_id = vision_start_token_id
+        self.vision_end_token_id = vision_end_token_id
+        
+        # Ensure architectures is set for HF compatibility
+        if "architectures" not in kwargs:
+            kwargs["architectures"] = ["QwenQwenHybrid"]
+            
+        super().__init__(**kwargs)
+
+
+# Inherit from PreTrainedModel
+class QwenQwenHybrid(PreTrainedModel):
     """
     Qwen2.5-VL vision + Qwen3-4B language model hybrid.
     - Same model family for better compatibility
     - Simpler adapter without complex stabilization
     - Native thinking support in Qwen3
     """
-    def __init__(self,
-                 vision_model_name="Qwen/Qwen2.5-VL-7B-Instruct",
-                 language_model_name="Qwen/Qwen3-4B",
-                 disable_pooling=True):  # Default to passing all tokens
-        super().__init__()
+    config_class = QwenQwenHybridConfig
+
+    # Update __init__ to be config-based
+    def __init__(self, config: QwenQwenHybridConfig):
+        # Initialize PreTrainedModel
+        super().__init__(config)
 
         # Add vision cache for inference
         self._vision_cache = None
         self._cached_input_ids = None
         
-        # Store pooling preference
-        self.disable_pooling = disable_pooling
+        # Store pooling preference from config
+        self.disable_pooling = config.disable_pooling
+        
+        # Extract names from config
+        vision_model_name = config.vision_model_name
+        language_model_name = config.language_model_name
 
         # --- 1. Load Original Models ---
         logger.info(f"Loading Qwen2.5-VL vision components from: {vision_model_name}")
@@ -178,15 +216,6 @@ class QwenQwenHybrid(nn.Module):
 
         # No gradient hooks needed - AdaFactor handles stability
 
-        # Create a config object that mimics a transformers config
-        class HybridConfig:
-            def __init__(self, **kwargs):
-                for k, v in kwargs.items():
-                    setattr(self, k, v)
-
-            def to_dict(self):
-                return {k: v for k, v in self.__dict__.items() if not k.startswith('_')}
-
         # Get the actual vision token IDs from the tokenizer
         vision_start_id = self.tokenizer.convert_tokens_to_ids("<|vision_start|>")
         vision_end_id = self.tokenizer.convert_tokens_to_ids("<|vision_end|>")
@@ -197,16 +226,17 @@ class QwenQwenHybrid(nn.Module):
         logger.info(f"  <|vision_end|>: {vision_end_id}")
         logger.info(f"  <|image_pad|>: {image_pad_id}")
 
-        self.config = HybridConfig(
-            vision_model_name=vision_model_name,
-            language_model_name=language_model_name,
-            vision_placeholder_id=image_pad_id,  # Use the actual image_pad token
-            vision_start_token_id=vision_start_id,
-            vision_end_token_id=vision_end_id,
-            # Add some standard config attributes expected by Trainer
-            model_type="qwen_r1_hybrid",
-            architectures=["FinishedQwenR1Hybrid"],
-        )
+        # Update the config object (self.config)
+        self.config.vision_start_token_id = vision_start_id
+        self.config.vision_end_token_id = vision_end_id
+        self.config.vision_placeholder_id = image_pad_id
+        
+        # Synchronize crucial attributes from the LM config to the main config
+        self.config.eos_token_id = self.language_model.config.eos_token_id
+        # Handle potential None pad_token_id
+        self.config.pad_token_id = getattr(self.language_model.config, 'pad_token_id', self.tokenizer.pad_token_id)
+        self.config.bos_token_id = self.language_model.config.bos_token_id
+        self.config.vocab_size = self.language_model.config.vocab_size
 
         base_embeds = self.language_model.get_input_embeddings()
         # Register as parameters - ensure they require grad
@@ -239,8 +269,7 @@ class QwenQwenHybrid(nn.Module):
         # This prevents the model from updating running statistics during training
         self.vision_model.eval()
 
-        # Set the device attribute for Trainer compatibility
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # Don't set the device attribute - PreTrainedModel handles this
 
         # Log trainable parameters info
         trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -253,6 +282,24 @@ class QwenQwenHybrid(nn.Module):
             if param.requires_grad:
                 logger.debug(f"  {name}: {param.shape}")
 
+    # === Helper method for Training Script Compatibility ===
+    @classmethod
+    def from_base_models(cls,
+                         vision_model_name="Qwen/Qwen2.5-VL-7B-Instruct",
+                         language_model_name="Qwen/Qwen3-4B",
+                         disable_pooling=True):
+        """Helper method to initialize the model from base components, used by the training script."""
+        logger.info("Initializing QwenQwenHybrid using from_base_models (Training mode).")
+        # Create the configuration first
+        config = QwenQwenHybridConfig(
+            vision_model_name=vision_model_name,
+            language_model_name=language_model_name,
+            disable_pooling=disable_pooling
+        )
+        # Initialize the model using the config (calls __init__)
+        model = cls(config)
+        return model
+
     def get_input_embeddings(self):
         """Get input embeddings from the language model."""
         return self.language_model.get_input_embeddings()
@@ -260,6 +307,54 @@ class QwenQwenHybrid(nn.Module):
     def set_input_embeddings(self, value):
         """Set input embeddings for the language model."""
         self.language_model.set_input_embeddings(value)
+    
+    # === NEW: Required Generation Methods ===
+    def get_output_embeddings(self):
+        """Delegate to the language model's output embeddings (the 'lm_head')."""
+        return self.language_model.get_output_embeddings()
+
+    def set_output_embeddings(self, new_embeddings):
+        self.language_model.set_output_embeddings(new_embeddings)
+
+    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, attention_mask=None, **kwargs):
+        """
+        Prepares inputs for the next step of generation.
+        Distinguishes between prefill (with vision) and decoding (last token only).
+        """
+        
+        if past_key_values is not None:
+            # Decoding phase (cache is present)
+            # 1. Only pass the last token generated
+            input_ids = input_ids[:, -1:]
+            # 2. Vision inputs are no longer needed (context is in the cache)
+            pixel_values = None
+            image_grid_thw = None
+        else:
+            # Prefill phase (first step)
+            # Keep vision inputs if provided in kwargs
+            pixel_values = kwargs.get("pixel_values", None)
+            image_grid_thw = kwargs.get("image_grid_thw", None)
+
+        # Construct the dictionary passed to model.forward()
+        model_inputs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "past_key_values": past_key_values,
+            "pixel_values": pixel_values,
+            "image_grid_thw": image_grid_thw,
+            "use_cache": kwargs.get("use_cache", True),
+        }
+        return model_inputs
+
+    @staticmethod
+    def _reorder_cache(past_key_values, beam_idx):
+        """Required for beam search support."""
+        reordered_past = ()
+        for layer_past in past_key_values:
+            reordered_past += (
+                tuple(past_state.index_select(0, beam_idx.to(past_state.device)) for past_state in layer_past),
+            )
+        return reordered_past
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
         """Enable gradient checkpointing for the language model."""
@@ -706,46 +801,73 @@ class QwenQwenHybrid(nn.Module):
         
         return outputs
 
-    def save_pretrained(self, save_directory: str):
+    def save_pretrained(self, save_directory: str, **kwargs):
         path = Path(save_directory)
         path.mkdir(parents=True, exist_ok=True)
-        with open(path / "adapter_config.json", "w") as f:
-            json.dump(self.config.to_dict(), f, indent=2)
-        # Save trainable state dict (merger MLP layers + post_proj_ln + extra_gate)
+        
+        # 1. Save the configuration (saves as config.json)
+        self.config.save_pretrained(save_directory)
+        
+        # 2. Save trainable state dict (vision_adapter.pt)
         trainable_state_dict = {
             'vision_merger_state': self.vision_model.merger.state_dict(),
             'vision_start_embedding': self.vision_start_embedding,
             'vision_end_embedding': self.vision_end_embedding,
-            'post_proj_ln_state': self.post_proj_ln.state_dict(),  # Save LayerNorm
-            'extra_gate': self.extra_gate,  # Always save for checkpoint compatibility
+            'post_proj_ln_state': self.post_proj_ln.state_dict(),
+            'extra_gate': self.extra_gate,
         }
         torch.save(trainable_state_dict, path / "vision_adapter.pt")
 
-        # No LoRA to save - language model is frozen
-
-        self.tokenizer.save_pretrained(save_directory)
-        logger.info(f"Merger MLP weights, post_proj_ln, and extra_gate saved to {save_directory}")
+        # 3. Save the tokenizer
+        if hasattr(self, 'tokenizer') and self.tokenizer:
+            self.tokenizer.save_pretrained(save_directory)
+            
+        logger.info(f"Configuration and adapter weights saved to {save_directory}")
 
     @classmethod
-    def from_pretrained(cls, model_directory: str):
-        path = Path(model_directory)
-        with open(path / "adapter_config.json", "r") as f:
-            config = json.load(f)
-        model = cls(config.get('vision_model_name'), config.get('language_model_name'))
-        # Load saved weights
-        adapter_state = torch.load(path / "vision_adapter.pt", map_location="cpu")
+    def from_pretrained(cls, pretrained_model_name_or_path: str, **kwargs):
+        path = Path(pretrained_model_name_or_path)
+
+        # 1. Load the configuration
+        # Handle legacy checkpoints (adapter_config.json) vs new checkpoints (config.json)
+        config_file = "config.json"
+        if not (path / "config.json").exists() and (path / "adapter_config.json").exists():
+            logger.warning("Loading legacy checkpoint (adapter_config.json). Please resave checkpoint to update to config.json.")
+            # Load legacy config and convert to new format
+            with open(path / "adapter_config.json", "r") as f:
+                legacy_config = json.load(f)
+            config = QwenQwenHybridConfig(
+                vision_model_name=legacy_config.get('vision_model_name', "Qwen/Qwen2.5-VL-7B-Instruct"),
+                language_model_name=legacy_config.get('language_model_name', "Qwen/Qwen3-4B"),
+                vision_placeholder_id=legacy_config.get('vision_placeholder_id'),
+                vision_start_token_id=legacy_config.get('vision_start_token_id'),
+                vision_end_token_id=legacy_config.get('vision_end_token_id'),
+            )
+        else:
+            # Load the config using the standard HF mechanism
+            config = QwenQwenHybridConfig.from_pretrained(pretrained_model_name_or_path, **kwargs)
+
+        # 2. Initialize the model structure (loads base models)
+        model = cls(config)
+
+        # 3. Load the custom adapter weights
+        adapter_weights_path = path / "vision_adapter.pt"
+        if not adapter_weights_path.exists():
+            raise FileNotFoundError(f"Adapter weights (vision_adapter.pt) not found in {pretrained_model_name_or_path}")
+
+        adapter_state = torch.load(adapter_weights_path, map_location="cpu")
         model.vision_model.merger.load_state_dict(adapter_state['vision_merger_state'])
         model.vision_start_embedding.data.copy_(adapter_state['vision_start_embedding'].data)
         model.vision_end_embedding.data.copy_(adapter_state['vision_end_embedding'].data)
         
-        # Load post_proj_ln if present (backward compatibility)
+        # Load post_proj_ln if present
         if 'post_proj_ln_state' in adapter_state:
             model.post_proj_ln.load_state_dict(adapter_state['post_proj_ln_state'])
             logger.info(f"Loaded post_proj_ln from checkpoint")
         else:
             logger.warning("post_proj_ln_state missing in checkpoint - using fresh initialization (expect loss spike)")
         
-        # Load extra_gate if present (backward compatibility)  
+        # Load extra_gate if present
         if 'extra_gate' in adapter_state:
             model.extra_gate.data.copy_(adapter_state['extra_gate'].data)
             logger.info(f"Loaded extra_gate={adapter_state['extra_gate'].item():.3f} from checkpoint")
@@ -757,22 +879,26 @@ class QwenQwenHybrid(nn.Module):
         logger.info(f"post_proj_ln beta mean={model.post_proj_ln.bias.mean().item():.4f}")
         logger.info(f"extra_gate={model.extra_gate.item():.3f}")
 
-        # Load LoRA adapter if it exists
+        # 4. Load LoRA adapter if it exists
         lora_path = path / "lora_adapter"
         if lora_path.exists():
             from peft import PeftModel
-            # We're not using LoRA in this setup, so just use the language model directly
             model.language_model = PeftModel.from_pretrained(model.language_model, str(lora_path))
             logger.info(f"Loaded LoRA adapter from {lora_path}")
 
-        logger.info(f"Loaded hybrid model from {model_directory}")
+        logger.info(f"Loaded hybrid model from {pretrained_model_name_or_path}")
         return model
+
+# Register with AutoModel
+AutoConfig.register("qwen_qwen_hybrid", QwenQwenHybridConfig)
+AutoModelForCausalLM.register(QwenQwenHybridConfig, QwenQwenHybrid)
 
 # --- Test ---
 if __name__ == "__main__":
-    model = FinishedQwenR1Hybrid()
+    # Update the test block to use the new helper method
+    model = QwenQwenHybrid.from_base_models()
     trainable_params = sum(p.numel() for p in model.get_trainable_parameters())
     logger.info(f"Total trainable parameters: {trainable_params:,}")
     model.save_pretrained("./qwen_r1_finished_hybrid")
-    loaded_model = FinishedQwenR1Hybrid.from_pretrained("./qwen_r1_finished_hybrid")
+    loaded_model = QwenQwenHybrid.from_pretrained("./qwen_r1_finished_hybrid")
     logger.info("Model saved and loaded successfully!")

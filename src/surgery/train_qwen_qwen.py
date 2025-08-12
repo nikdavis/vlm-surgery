@@ -557,10 +557,10 @@ def main(output_dir, data_path, batch_size, gradient_accumulation, learning_rate
     # 1. Instantiate the Qwen-Qwen hybrid model
     if enable_vision_pooling:
         logger.info("Vision pooling ENABLED - using token sampling/pooling")
-        model = QwenQwenHybrid(disable_pooling=False)
+        model = QwenQwenHybrid.from_base_models(disable_pooling=False)
     else:
         logger.info("Vision pooling DISABLED (default) - passing all vision tokens directly")
-        model = QwenQwenHybrid(disable_pooling=True)
+        model = QwenQwenHybrid.from_base_models(disable_pooling=True)
     tokenizer = model.tokenizer
 
     # Load Qwen processor for image processing
