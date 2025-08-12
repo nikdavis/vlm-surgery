@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoModel, BitsAndBytesConfig
@@ -22,12 +23,16 @@ class QwenQwenHybrid(nn.Module):
     """
     def __init__(self,
                  vision_model_name="Qwen/Qwen2.5-VL-7B-Instruct",
-                 language_model_name="Qwen/Qwen3-4B"):
+                 language_model_name="Qwen/Qwen3-4B",
+                 disable_pooling=True):  # Default to passing all tokens
         super().__init__()
 
         # Add vision cache for inference
         self._vision_cache = None
         self._cached_input_ids = None
+        
+        # Store pooling preference
+        self.disable_pooling = disable_pooling
 
         # --- 1. Load Original Models ---
         logger.info(f"Loading Qwen2.5-VL vision components from: {vision_model_name}")
@@ -35,10 +40,21 @@ class QwenQwenHybrid(nn.Module):
         from transformers import Qwen2_5_VLForConditionalGeneration
         logger.debug(f"About to load Qwen2_5_VLForConditionalGeneration from {vision_model_name}")
         # Load without device_map first to avoid meta tensors
-        qwen_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            vision_model_name,
-            torch_dtype=torch.float16,
-        )
+        # DDP support: Place vision model on same device as language model
+        local_rank = int(os.environ.get("LOCAL_RANK", -1))
+        if local_rank >= 0:
+            # DDP mode: load on CPU first, then move to specific GPU
+            qwen_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                vision_model_name,
+                torch_dtype=torch.float16,
+                device_map={"": local_rank},
+            )
+        else:
+            # Single GPU mode: simple load
+            qwen_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                vision_model_name,
+                torch_dtype=torch.float16,
+            )
         logger.info(f"Successfully loaded model of type: {type(qwen_model)}")
         # Access visual model directly from the model
         self.vision_model = qwen_model.visual
@@ -74,10 +90,21 @@ class QwenQwenHybrid(nn.Module):
             logger.info("Flash Attention 2 not available, using SDPA (still efficient)")
         
         # Load model in 8-bit for memory efficiency (but no LoRA)
+        # DDP support: Use local rank for device_map if DDP is active
+        local_rank = int(os.environ.get("LOCAL_RANK", -1))
+        if local_rank >= 0:
+            # DDP mode: place model on specific GPU
+            device_map = {"": local_rank}
+            logger.info(f"DDP mode: loading model on device {local_rank}")
+        else:
+            # Single GPU mode: use auto
+            device_map = "auto"
+            logger.info("Single GPU mode: using device_map='auto'")
+        
         self.language_model = AutoModelForCausalLM.from_pretrained(
             language_model_name,
             quantization_config=bnb_config,
-            device_map="auto",  # Needed for 8-bit
+            device_map=device_map,  # DDP-aware device placement
             torch_dtype=torch.bfloat16,  # Use bf16 to avoid casts
             **extra_load_kwargs,
         )
@@ -123,8 +150,8 @@ class QwenQwenHybrid(nn.Module):
         class DtypeWrapper(nn.Module):
             def __init__(self, in_dim, out_dim):
                 super().__init__()
-                # Add pre-LayerNorm for stability
-                self.pre_ln = nn.LayerNorm(in_dim)
+                # Add pre-LayerNorm for stability (fp32 by default)
+                self.pre_ln = nn.LayerNorm(in_dim, eps=1e-5)
                 # Use fp32 for stability
                 self.linear = nn.Linear(in_dim, out_dim, bias=True, dtype=torch.float32)
                 # ZERO-INIT for safety - adapter starts "off"
@@ -132,14 +159,14 @@ class QwenQwenHybrid(nn.Module):
                 nn.init.zeros_(self.linear.bias)
 
             def forward(self, x):
-                # Keep in bf16 for efficiency
+                # Do LayerNorm and Linear in fp32 for numerical stability
                 orig_dtype = x.dtype
-                x = x.to(torch.bfloat16)
-                x = self.pre_ln(x)  # Pre-normalize
+                x = x.to(torch.float32)  # Convert to fp32 for stable LayerNorm
+                x = self.pre_ln(x)  # Pre-normalize in fp32
                 # Guard against bad upstream values
                 x = torch.clamp(x, -10.0, 10.0)
-                x = self.linear(x)
-                x = x.to(orig_dtype)
+                x = self.linear(x)  # Linear also in fp32
+                x = x.to(orig_dtype)  # Convert back to original dtype (bf16)
                 return x
 
         # Replace with our wrapper
@@ -189,12 +216,21 @@ class QwenQwenHybrid(nn.Module):
         self.vision_end_embedding.requires_grad = True
 
         # Add post-projection LayerNorm for stability (create BEFORE freezing)
-        self.post_proj_ln = nn.LayerNorm(self.r1_hidden_dim)  # Post-norm on LLM dims
+        # Use bfloat16 to match vision embeddings dtype
+        self.post_proj_ln = nn.LayerNorm(self.r1_hidden_dim, dtype=torch.bfloat16)  # Post-norm on LLM dims
 
-        # Curriculum knobs for token resampling
-        self.base_k = 16  # Start with small number of pooled tokens
-        self.use_soft_gate = True
+        # Always create extra_gate for checkpoint compatibility
         self.extra_gate = nn.Parameter(torch.zeros(1))  # Learnable gate, tanh() ~ 0 at init
+        
+        # Curriculum knobs for token resampling (only used when pooling is enabled)
+        if self.disable_pooling:
+            logger.info("Vision pooling DISABLED: all vision tokens will be passed through")
+        else:
+            self.base_k = 16  # Start with small number of pooled tokens
+            self.max_vision_tokens = 128  # Start conservative, will be ramped by curriculum
+            self.allow_extra_tokens = False  # Will be enabled by curriculum
+            self.use_soft_gate = True
+            logger.info(f"Vision pooling ENABLED: max_tokens={self.max_vision_tokens}, base_k={self.base_k}")
 
         del qwen_model
         self._freeze_base_models()
@@ -349,8 +385,9 @@ class QwenQwenHybrid(nn.Module):
         # through it to reach our trainable merger projection
         # This is CRITICAL - no_grad breaks training completely!
 
-        # Use bf16 for vision path to save memory
-        with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+        # Disable autocast for vision path to ensure numerical stability
+        # The DtypeWrapper already handles fp32 conversion where needed
+        with torch.cuda.amp.autocast(enabled=False):
             # Use the vision model's forward method
             # Skip pre-norm due to Qwen2.5-VL's special block requirements
             # The post-projection LayerNorm will provide stability
@@ -499,31 +536,43 @@ class QwenQwenHybrid(nn.Module):
             # Get the vision embeddings for this sample
             vis = vision_embeds_list[i]  # [T, D] projected+LN'd
 
-            # ===== Token curriculum with hard cap =====
-            max_vision_tokens = 128  # Hard cap to save memory
-            
-            # Build: [global, base_k pooled tokens, optional extra tokens]
-            global_tok = self._global_token(vis)  # [1, D]
-            base_k = min(self.base_k, max_vision_tokens - 1)  # Leave room for global token
-            base_pooled = self._resample_tokens(vis, k=base_k)  # [base_k, D]
-            
-            # Only use extra tokens if curriculum allows and we have budget
-            use_extras = self.training and getattr(self, "allow_extra_tokens", False)
-            if use_extras:
-                extra_budget = max_vision_tokens - (1 + base_pooled.shape[0])
-                if extra_budget > 0:
-                    # Sample extra tokens evenly from the vision features
-                    idx = torch.linspace(0, vis.shape[0] - 1, steps=extra_budget, device=vis.device).long()
-                    extra_tokens = vis.index_select(0, idx)
-                    if self.use_soft_gate:
-                        extra_tokens = torch.tanh(self.extra_gate) * extra_tokens
-                    vision_embeds = torch.cat([global_tok, base_pooled, extra_tokens], dim=0)
-                else:
-                    vision_embeds = torch.cat([global_tok, base_pooled], dim=0)
+            if self.disable_pooling:
+                # Pass all vision tokens directly without any pooling/sampling
+                vision_embeds = vis
             else:
-                # No extras - just global + base pooled
-                vision_embeds = torch.cat([global_tok, base_pooled], dim=0)
-            # =============================
+                # ===== Token curriculum with adjustable cap =====
+                # Build: [global, base_k pooled tokens, optional extra tokens]
+                global_tok = self._global_token(vis)  # [1, D]
+                base_k = min(self.base_k, self.max_vision_tokens - 1)  # Leave room for global token
+                base_pooled = self._resample_tokens(vis, k=base_k)  # [base_k, D]
+                
+                # Only use extra tokens if curriculum allows and we have budget
+                use_extras = self.training and self.allow_extra_tokens
+                if use_extras:
+                    extra_budget = self.max_vision_tokens - (1 + base_pooled.shape[0])
+                    if extra_budget > 0:
+                        # Sample extra tokens evenly from the vision features
+                        idx = torch.linspace(0, vis.shape[0] - 1, steps=extra_budget, device=vis.device).long()
+                        extra_tokens = vis.index_select(0, idx)
+                        if self.use_soft_gate:
+                            extra_tokens = torch.tanh(self.extra_gate) * extra_tokens
+                        vision_embeds = torch.cat([global_tok, base_pooled, extra_tokens], dim=0)
+                    else:
+                        vision_embeds = torch.cat([global_tok, base_pooled], dim=0)
+                else:
+                    # No extras - just global + base pooled
+                    vision_embeds = torch.cat([global_tok, base_pooled], dim=0)
+                # =============================
+            
+            # Log vision token usage (first few steps only for debugging)
+            if not hasattr(self, '_vision_token_log_count'):
+                self._vision_token_log_count = 0
+            if self._vision_token_log_count < 5:
+                if self.disable_pooling:
+                    logger.info(f"[seq] vision_tokens={vision_embeds.shape[0]} (all tokens, no pooling)")
+                else:
+                    logger.info(f"[seq] vision_tokens={vision_embeds.shape[0]} max_cap={self.max_vision_tokens} base_k={self.base_k} extras={'on' if self.allow_extra_tokens else 'off'}")
+                self._vision_token_log_count += 1
 
             # Debug vision embedding - commented out now that it's working
             # if i < 2 and hasattr(self, '_forward_debug'):
@@ -647,7 +696,7 @@ class QwenQwenHybrid(nn.Module):
             'vision_start_embedding': self.vision_start_embedding,
             'vision_end_embedding': self.vision_end_embedding,
             'post_proj_ln_state': self.post_proj_ln.state_dict(),  # Save LayerNorm
-            'extra_gate': self.extra_gate,  # Save curriculum gate
+            'extra_gate': self.extra_gate,  # Always save for checkpoint compatibility
         }
         torch.save(trainable_state_dict, path / "vision_adapter.pt")
 

@@ -58,6 +58,7 @@ class VirtualDataset(Dataset):
         """
         self.seed = seed
         self.rng = np.random.default_rng(seed)
+        self.training = True  # Default to training mode, can be set to False for eval
 
         if manifest_path:
             self._load_from_manifest(manifest_path)
@@ -174,100 +175,91 @@ class VirtualDataset(Dataset):
         """
         start_time = time.time()
         
-        with logfire.span(
-            'virtual_dataset.get_sample',
-            index=index,
-            phase='A' if index < self.real_length else 'B'
-        ):
-            if index < 0 or index >= self.virtual_length:
-                raise IndexError(f"Index {index} out of range [0, {self.virtual_length})")
+        # Disabled logfire span - too noisy during training
+        if index < 0 or index >= self.virtual_length:
+            raise IndexError(f"Index {index} out of range [0, {self.virtual_length})")
+        
+        # Determine which phase this index belongs to
+        if index < self.real_length:
+            # Phase A: Identity only
+            real_idx = self.order_a[index]
+            force_identity = True
+            phase = "Phase A (identity)"
+        else:
+            # Phase B: 30/70 split handled by IdentityOrAug
+            phase_b_idx = index - self.real_length
+            real_idx = self.order_b[phase_b_idx]
+            force_identity = False
+            phase = "Phase B (mixed)"
             
-            # Determine which phase this index belongs to
-            if index < self.real_length:
-                # Phase A: Identity only
-                real_idx = self.order_a[index]
-                force_identity = True
-                phase = "Phase A (identity)"
-            else:
-                # Phase B: 30/70 split handled by IdentityOrAug
-                phase_b_idx = index - self.real_length
-                real_idx = self.order_b[phase_b_idx]
-                force_identity = False
-                phase = "Phase B (mixed)"
+        # Get canonical sample from adapter (LAZY LOADING HERE)
+        adapter_start = time.time()
+        sample = self.adapter.get_canonical_sample(int(real_idx))
+        adapter_time = time.time() - adapter_start
             
-            # Get canonical sample from adapter (LAZY LOADING HERE)
-            with logfire.span('adapter.get_sample', real_idx=int(real_idx)):
-                adapter_start = time.time()
-                sample = self.adapter.get_canonical_sample(int(real_idx))
-                adapter_time = time.time() - adapter_start
-                # logfire.debug(f"Loaded sample from Parquet in {adapter_time:.3f}s", adapter_time_ms=adapter_time*1000)
+        # Apply transforms
+        if self.transform_pipeline:
+            transform_start = time.time()
+            # Create deterministic RNG for this specific index
+            sample_seed = index + (self.seed or 0)
+            sample_rng = np.random.default_rng(sample_seed)
             
-            # Apply transforms
-            if self.transform_pipeline:
-                with logfire.span('apply_transforms', force_identity=force_identity):
-                    transform_start = time.time()
-                    # Create deterministic RNG for this specific index
-                    sample_seed = index + (self.seed or 0)
-                    sample_rng = np.random.default_rng(sample_seed)
-                    
-                    # Pass force_identity flag for Phase A
-                    if force_identity:
-                        sample['__force_identity__'] = True
-                    
-                    sample = self.transform_pipeline(sample, sample_rng)
-                    
-                    # Clean up the flag
-                    sample.pop('__force_identity__', None)
-                    
-                    transform_time = time.time() - transform_start
-                    # logfire.debug(f"Applied transforms in {transform_time:.3f}s", transform_time_ms=transform_time*1000)
+            # Pass force_identity flag for Phase A
+            if force_identity:
+                sample['__force_identity__'] = True
             
-            # Format output for collator
-            with logfire.span('format_output'):
-                # For caption datasets: put caption in assistant slot, minimal prompt in user
-                # Use varied prompts for training diversity (caption-appropriate)
-                caption_prompts = [
-                    "Please generate a caption for this image.",
-                    "Write a caption for this image.",
-                    "What's shown in this image?",
-                    "Describe what you see.",
-                    "Caption this image.",
-                    "What does this image show?",
-                    "Provide a caption."
-                ]
-                
-                # Randomly select a prompt for training diversity
-                # (eval uses the base prompt for fair comparison)
-                prompt = random.choice(caption_prompts) if self.training else "Please generate a caption for this image."
-                
-                output = {
-                    "images": [sample["image"]],  # PIL image in a list
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "image"},
-                                {"type": "text", "text": prompt}
-                            ]
-                        },
-                        {
-                            "role": "assistant",
-                            "content": [
-                                {"type": "text", "text": sample["prompts"][0]}  # Caption goes here for training
-                            ]
-                        }
+            sample = self.transform_pipeline(sample, sample_rng)
+            
+            # Clean up the flag
+            sample.pop('__force_identity__', None)
+            
+            transform_time = time.time() - transform_start
+            
+        # Format output for collator
+        # For caption datasets: put caption in assistant slot, minimal prompt in user
+        # Use varied prompts for training diversity (caption-appropriate)
+        caption_prompts = [
+            "Please generate a caption for this image.",
+            "Write a caption for this image.",
+            "What's shown in this image?",
+            "Describe what you see.",
+            "Caption this image.",
+            "What does this image show?",
+            "Provide a caption."
+        ]
+        
+        # Randomly select a prompt for training diversity
+        # (eval uses the base prompt for fair comparison)
+        prompt = random.choice(caption_prompts) if self.training else "Please generate a caption for this image."
+        
+        output = {
+            "images": [sample["image"]],  # PIL image in a list
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {"type": "text", "text": prompt}
+                    ]
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": sample["prompts"][0]}  # Caption goes here for training
                     ]
                 }
-            
-            total_time = time.time() - start_time
-            # logfire.debug(
-            #     f"{phase}: Generated sample {index} in {total_time:.3f}s",
-            #     total_time_ms=total_time*1000,
-            #     phase=phase,
-            #     index=index
-            # )
-            
-            return output
+            ]
+        }
+        
+        total_time = time.time() - start_time
+        # logfire.debug(
+        #     f"{phase}: Generated sample {index} in {total_time:.3f}s",
+        #     total_time_ms=total_time*1000,
+        #     phase=phase,
+        #     index=index
+        # )
+        
+        return output
 
     def __iter__(self) -> Iterator[Dict[str, Any]]:
         """

@@ -18,13 +18,30 @@ from loguru import logger
 from transformers import AutoProcessor
 from src.surgery.qwen_qwen_vision import QwenQwenHybrid
 
+
+USE_REASONING = True
+
 system_prompt = """
-You are a guessing engine.
-You will guess exactly one object that appears in the provided image context tokens.
-Do not explain. Do not mention uncertainty.
-Output only the object's name as a single word.
+You are an image analysis assistant. You are shown an image (internally)
+and asked about it. Be helpful, thorough, precise, and concise.
 """
 
+caption_prompt = """
+Describe this image as JSON with this exact structure:
+{
+  "caption": "detailed description of the image",
+  "short_caption": "Short, factual caption, max 30 words. No style words or opinions.",
+  "abstractions": {
+  "mood_and_atmosphere": ["list", "of", "moods"],
+  "themes_and_concepts": ["list", "of", "themes"],
+  "genre_and_style": ["list", "of", "styles"]
+},
+  "scene_composition": {"perspective": "value", "focal_point": "value", etc},
+  "meta_media": {"medium": "value", "look": "value", etc},
+  "features": {"objects": "description", "colors": "description", etc}
+}
+ALL values in features, scene_composition, and meta_media must be strings.
+"""
 
 def _find_user_insert_pos(tokenizer, ids):
     """Insert after <｜User｜> if present; fallback to legacy prefix."""
@@ -51,14 +68,15 @@ def _extract_assistant_span(full_text: str) -> str:
 @click.command()
 @click.option("--checkpoint", required=True, help="Adapter dir containing adapter_config.json & vision_adapter.pt")
 @click.option("--image", required=True, type=str, help="Image path")
-@click.option("--prompt", required=True, type=str, help="User prompt")
+@click.option("--prompt", default="Please describe this image.", type=str, help="User prompt")
+@click.option("--caption", is_flag=True, help="Use caption prompt")
 @click.option("--system", default=system_prompt)
 @click.option("--max-tokens", default=128, type=int)
 @click.option("--num-shots", default=10, type=int, help="Number of independent generations to produce.")
 @click.option("--temperature", default=0.4, type=float)
 @click.option("--top-p", default=0.9, type=float)
 @click.option("--do-sample/--no-sample", default=True)
-def main(checkpoint, image, prompt, system, max_tokens, num_shots, temperature, top_p, do_sample):
+def main(checkpoint, image, prompt, caption, system, max_tokens, num_shots, temperature, top_p, do_sample):
     logger.remove()
     logger.add(lambda m: print(m, end=""), level="INFO", format="{time:HH:mm:ss} | {level:<7} | {message}")
 
@@ -86,10 +104,18 @@ def main(checkpoint, image, prompt, system, max_tokens, num_shots, temperature, 
 
     # Chat prefix using template; add_generation_prompt=True adds assistant header
     messages = []
+    enable_thinking = USE_REASONING
     if system:
         messages.append({"role": "system", "content": system})
-    messages.append({"role": "user", "content": prompt})
-    text_prefix = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+    if caption:
+        messages.append({"role": "user", "content": caption_prompt})
+        max_tokens = 3000
+        enable_thinking = True
+        temperature = 0.2
+        num_shots = 1
+    else:
+        messages.append({"role": "user", "content": prompt})
+    text_prefix = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=enable_thinking)
 
     # Insert exactly one <|image_pad|> after the user tag
     ids = tok.encode(text_prefix, add_special_tokens=False)

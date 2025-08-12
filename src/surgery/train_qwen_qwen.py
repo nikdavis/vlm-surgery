@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Train the Qwen2.5-VL + DeepSeekR1 hybrid model on a single GPU.
-This script uses gradient checkpointing to save memory.
+Train the Qwen2.5-VL + DeepSeekR1 hybrid model on single or multi-GPU.
+This script uses gradient checkpointing to save memory and supports DDP.
 """
 from pathlib import Path
 import torch
@@ -15,6 +15,7 @@ from loguru import logger
 import os
 import torch.utils.data
 from math import ceil, cos, pi
+import torch.distributed as dist
 
 # Configure loguru from environment
 log_level = os.getenv('LOGURU_LEVEL', 'INFO')
@@ -98,17 +99,27 @@ class AdapterOnlyTrainer(Trainer):
             
             logger.info("✓ Adapter weights restored")
             
-            # Restore optimizer if present
+            # Restore optimizer if present (with error handling for mismatches)
             opt_path = os.path.join(checkpoint, "optimizer.pt")
             if self.optimizer and os.path.exists(opt_path):
-                self.optimizer.load_state_dict(torch.load(opt_path, map_location="cpu"))
-                logger.info("✓ Optimizer state restored")
+                try:
+                    self.optimizer.load_state_dict(torch.load(opt_path, map_location="cpu"))
+                    logger.info("✓ Optimizer state restored")
+                except Exception as e:
+                    logger.warning(f"Could not restore optimizer state ({type(e).__name__}: {e})")
+                    logger.warning("Initializing fresh optimizer (momentum will reset)")
+                    # Optimizer stays freshly initialized
             
-            # Restore scheduler if present
+            # Restore scheduler if present (with error handling)
             sched_path = os.path.join(checkpoint, "scheduler.pt")
             if self.lr_scheduler and os.path.exists(sched_path):
-                self.lr_scheduler.load_state_dict(torch.load(sched_path, map_location="cpu"))
-                logger.info("✓ Scheduler state restored")
+                try:
+                    self.lr_scheduler.load_state_dict(torch.load(sched_path, map_location="cpu"))
+                    logger.info("✓ Scheduler state restored")
+                except Exception as e:
+                    logger.warning(f"Could not restore scheduler state ({type(e).__name__}: {e})")
+                    logger.warning("Using fresh scheduler (learning rate schedule will restart)")
+                    # Scheduler stays freshly initialized
             
             # Restore RNG state if present
             rng_path = os.path.join(checkpoint, "rng_state.pth")
@@ -148,10 +159,11 @@ class CoTDataCollator:
     Handles batching and creates masked labels for CoT training.
     Manual handling for cross-model compatibility (Qwen2.5-VL vision + Qwen3 R1 language).
     """
-    def __init__(self, tokenizer: AutoTokenizer, processor: AutoProcessor, placeholder_id: int):
+    def __init__(self, tokenizer: AutoTokenizer, processor: AutoProcessor, placeholder_id: int, model=None):
         self.tokenizer = tokenizer  # Qwen3 R1 tokenizer
         self.image_processor = processor.image_processor  # Only use image processor from Qwen2.5-VL
         self.placeholder_id = placeholder_id  # The unused token we're repurposing
+        self.model = model  # Optional reference to track vision token settings
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
@@ -361,6 +373,16 @@ class CoTDataCollator:
         )
         labels = torch.nn.utils.rnn.pad_sequence(labels_list, batch_first=True, padding_value=-100)
         
+        # Track batch statistics for comprehensive logging
+        if not hasattr(self, '_batch_count'):
+            self._batch_count = 0
+            self._total_seq_length = 0
+            self._total_valid_tokens = 0
+            self._batches_with_images = 0
+            self._log_interval = 10  # Log every 10 batches
+        
+        self._batch_count += 1
+        
         # Sanity check
         if not hasattr(self, '_labels_final_logged'):
             valid_before = (labels != -100).sum().item()
@@ -377,7 +399,26 @@ class CoTDataCollator:
         if images:
             image_inputs = self.image_processor(images, return_tensors="pt")
             image_outputs = image_inputs
+            self._batches_with_images += 1
 
+        # Collect statistics
+        batch_size = input_ids.shape[0]
+        seq_length = input_ids.shape[1]
+        valid_tokens = (labels != -100).sum().item()
+        
+        self._total_seq_length += seq_length * batch_size
+        self._total_valid_tokens += valid_tokens
+        
+        # Log statistics periodically
+        if self._batch_count % self._log_interval == 0:
+            avg_seq_length = self._total_seq_length / (self._batch_count * batch_size)
+            avg_valid_tokens = self._total_valid_tokens / self._batch_count
+            pct_with_images = (self._batches_with_images / self._batch_count) * 100
+            
+            logger.info(f"[BATCH STATS {self._batch_count}] "
+                       f"avg_seq_len={avg_seq_length:.1f}, "
+                       f"avg_valid_tokens={avg_valid_tokens:.1f}, "
+                       f"batches_with_images={pct_with_images:.1f}%")
 
         # Combine everything
         result = {
@@ -393,10 +434,13 @@ class CoTDataCollator:
         return result
 
 class PercentCurriculum(TrainerCallback):
-    """Curriculum callback that adjusts K and gate based on training progress percentage."""
-    def __init__(self, start_k=16, end_k=64, gate_max=1.5, stage1_pct=0.15, ramp_end_pct=0.50):
+    """Curriculum callback that adjusts K, gate, and vision token cap based on training progress percentage."""
+    def __init__(self, start_k=16, end_k=64, gate_max=1.5, 
+                 start_cap=64, mid_cap=256, end_cap=512,
+                 stage1_pct=0.15, ramp_end_pct=0.50):
         self.start_k, self.end_k = start_k, end_k
         self.gate_max = gate_max
+        self.start_cap, self.mid_cap, self.end_cap = start_cap, mid_cap, end_cap
         self.stage1_pct = stage1_pct
         self.ramp_end_pct = ramp_end_pct
         self.total_updates = None
@@ -421,25 +465,39 @@ class PercentCurriculum(TrainerCallback):
         """Adjust curriculum parameters based on progress."""
         if model is None or self.total_updates is None:
             return control
+        
+        # Skip curriculum if pooling is disabled (all tokens pass through)
+        if getattr(model, 'disable_pooling', False):
+            return control
 
         p = min(1.0, state.global_step / self.total_updates)
 
-        # Stage 1: keep extras off
+        # Stage 1: keep extras off, minimal vision tokens
         if p <= self.stage1_pct:
             model.base_k = self.start_k
+            model.max_vision_tokens = self.start_cap
+            model.allow_extra_tokens = False
             if getattr(model, "use_soft_gate", False):
                 with torch.no_grad():
                     model.extra_gate.data.fill_(0.0)
             return control
 
-        # Stage 2: ramp K and gate (cosine ramp)
+        # Stage 2: ramp K, gate, and cap (cosine ramp)
         ramp = max(0.0, min(1.0, (p - self.stage1_pct) / (self.ramp_end_pct - self.stage1_pct + 1e-6)))
         smooth = 0.5 * (1 - cos(pi * ramp))
         model.base_k = int(round(self.start_k + smooth * (self.end_k - self.start_k)))
+        model.max_vision_tokens = int(round(self.start_cap + smooth * (self.mid_cap - self.start_cap)))
+        model.allow_extra_tokens = True  # Enable extras once ramping starts
 
         if getattr(model, "use_soft_gate", False):
             with torch.no_grad():
                 model.extra_gate.data.fill_(smooth * self.gate_max)
+        
+        # Stage 3: After ramp_end_pct, continue increasing cap to end_cap
+        if p >= self.ramp_end_pct:
+            tail = (p - self.ramp_end_pct) / max(1e-6, (1.0 - self.ramp_end_pct))
+            tail_smooth = 0.5 * (1 - cos(pi * tail))
+            model.max_vision_tokens = int(round(self.mid_cap + tail_smooth * (self.end_cap - self.mid_cap)))
 
         return control
 
@@ -457,7 +515,29 @@ class PercentCurriculum(TrainerCallback):
 @click.option("--quick-test", is_flag=True, help="Quick test mode: 10 examples, no accumulation, eval at step 1")
 @click.option("--resume-from-checkpoint", type=str, default=None, help="Path to checkpoint to resume from")
 @click.option("--disable-curriculum", is_flag=True, help="Disable curriculum learning (auto-disabled when resuming)")
-def main(output_dir, data_path, batch_size, gradient_accumulation, learning_rate, num_epochs, max_steps, use_8bit_adam, exclude_v1_data, exclude_captions, quick_test, resume_from_checkpoint, disable_curriculum):
+@click.option("--enable-vision-pooling", is_flag=True, help="Enable vision token pooling/sampling (default is to pass all tokens)")
+def main(output_dir, data_path, batch_size, gradient_accumulation, learning_rate, num_epochs, max_steps, use_8bit_adam, exclude_v1_data, exclude_captions, quick_test, resume_from_checkpoint, disable_curriculum, enable_vision_pooling):
+    # DDP setup (safe for single GPU - just no-ops)
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    
+    # Debug GPU visibility
+    logger.info(f"[rank {local_rank}] NVIDIA_VISIBLE_DEVICES={os.environ.get('NVIDIA_VISIBLE_DEVICES', 'not set')}")
+    logger.info(f"[rank {local_rank}] CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', 'not set')}")
+    logger.info(f"[rank {local_rank}] cuda_count={torch.cuda.device_count()}")
+    for i in range(torch.cuda.device_count()):
+        logger.info(f"[rank {local_rank}] device {i}: {torch.cuda.get_device_name(i)}")
+    
+    if world_size > 1:
+        if not dist.is_initialized():
+            dist.init_process_group(backend="nccl")
+        # Docker remaps GPUs 0,3 to 0,1 inside container
+        # So LOCAL_RANK maps directly to the remapped device index
+        torch.cuda.set_device(local_rank)
+        logger.info(f"[DDP] Rank {local_rank}/{world_size}, current_device={torch.cuda.current_device()}")
+    else:
+        logger.info("[Single GPU] Running without DDP")
+    
     # Quick test mode overrides
     if quick_test:
         logger.info("🚀 QUICK TEST MODE - Minimal training for validation")
@@ -475,7 +555,12 @@ def main(output_dir, data_path, batch_size, gradient_accumulation, learning_rate
     mlflow.set_experiment("qwen-qwen-hybrid-20250805")
 
     # 1. Instantiate the Qwen-Qwen hybrid model
-    model = QwenQwenHybrid()
+    if enable_vision_pooling:
+        logger.info("Vision pooling ENABLED - using token sampling/pooling")
+        model = QwenQwenHybrid(disable_pooling=False)
+    else:
+        logger.info("Vision pooling DISABLED (default) - passing all vision tokens directly")
+        model = QwenQwenHybrid(disable_pooling=True)
     tokenizer = model.tokenizer
 
     # Load Qwen processor for image processing
@@ -564,17 +649,46 @@ def main(output_dir, data_path, batch_size, gradient_accumulation, learning_rate
         train_dataset = torch.utils.data.Subset(full_dataset, range(10))
         val_dataset = torch.utils.data.Subset(full_dataset, range(10, min(12, len(full_dataset))))
     else:
-        # Normal split
-        if hasattr(full_dataset, 'get_train_val_split'):
+        # Normal split - improved for eval hygiene
+        if hasattr(full_dataset, 'real_length'):
+            # VirtualDataset: Use only Phase A (identity transforms) for eval
+            phase_a_indices = list(range(full_dataset.real_length))
+            val_size = min(int(full_dataset.real_length * 0.02), 500)  # Cap at 500 for speed
+            
+            # Fixed seed for deterministic eval split
+            eval_generator = torch.Generator().manual_seed(42)
+            val_indices = torch.randperm(full_dataset.real_length, generator=eval_generator)[:val_size].tolist()
+            train_indices = [i for i in phase_a_indices if i not in val_indices]
+            
+            # Train gets Phase A (minus val) + all Phase B; Val gets only Phase A subset
+            train_indices_full = train_indices + list(range(full_dataset.real_length, len(full_dataset)))
+            train_dataset = torch.utils.data.Subset(full_dataset, train_indices_full)
+            val_dataset = torch.utils.data.Subset(full_dataset, val_indices)
+            
+            logger.info(f"Eval using Phase A only (identity transforms) with fixed seed")
+        elif hasattr(full_dataset, 'get_train_val_split'):
             train_dataset, val_dataset = full_dataset.get_train_val_split(val_ratio=0.02)
         else:
-            # full_dataset is a Subset, do manual split
+            # full_dataset is a Subset, do manual split with fixed seed
             dataset_len = len(full_dataset)
             val_size = int(dataset_len * 0.02)
             train_size = dataset_len - val_size
+            
+            # Use fixed generator for deterministic split
+            split_generator = torch.Generator().manual_seed(42)
             train_dataset, val_dataset = torch.utils.data.random_split(
-                full_dataset, [train_size, val_size]
+                full_dataset, [train_size, val_size], generator=split_generator
             )
+
+    # Set eval dataset to use fixed prompt (not training mode)
+    if hasattr(full_dataset, 'training'):
+        # For VirtualDataset wrapped in Subset, need to access the underlying dataset
+        if hasattr(val_dataset, 'dataset') and hasattr(val_dataset.dataset, 'training'):
+            val_dataset.dataset.training = False
+            logger.info("Set eval dataset to use fixed prompt (training=False)")
+        elif hasattr(val_dataset, 'training'):
+            val_dataset.training = False
+            logger.info("Set eval dataset to use fixed prompt (training=False)")
 
     logger.info(f"Training set size: {len(train_dataset)} samples")
     logger.info(f"Validation set size: {len(val_dataset)} samples")
@@ -586,8 +700,12 @@ def main(output_dir, data_path, batch_size, gradient_accumulation, learning_rate
     output_dir = Path(output_dir) / run_name
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Choose optimizer based on flag
-    if use_8bit_adam:
+    # Choose optimizer based on flag and DDP mode
+    if world_size > 1:
+        # DDP mode: Use standard torch AdamW to avoid bitsandbytes multi-GPU issues
+        optimizer = "adamw_torch"  # Standard PyTorch AdamW
+        logger.info(f"[DDP] Using torch AdamW optimizer (avoids bitsandbytes multi-GPU issues)")
+    elif use_8bit_adam:
         optimizer = "paged_adamw_8bit"  # Paged 8-bit Adam from bitsandbytes
         logger.info("Using paged 8-bit Adam optimizer")
     else:
@@ -606,6 +724,7 @@ def main(output_dir, data_path, batch_size, gradient_accumulation, learning_rate
         if not quick_test:
             logger.info(f"Training for {num_epochs} epochs")
 
+    # DDP-aware training arguments
     training_args = TrainingArguments(
         output_dir=str(output_dir),
         per_device_train_batch_size=batch_size,
@@ -637,6 +756,9 @@ def main(output_dir, data_path, batch_size, gradient_accumulation, learning_rate
         gradient_checkpointing_kwargs={"use_reentrant": False},
         max_grad_norm=1.0,
         dataloader_num_workers=2,  # Use 2 workers for better IO
+        # DDP settings
+        ddp_find_unused_parameters=False,  # Better performance, we handle all params properly
+        ddp_backend="nccl" if world_size > 1 else None,  # Use NCCL for multi-GPU
         # Optimizer
         optim=optimizer,
         # Reporting
@@ -655,31 +777,41 @@ def main(output_dir, data_path, batch_size, gradient_accumulation, learning_rate
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
-        data_collator=CoTDataCollator(tokenizer, processor, placeholder_id=model.config.vision_placeholder_id),
+        data_collator=CoTDataCollator(tokenizer, processor, placeholder_id=model.config.vision_placeholder_id, model=model),
     )
 
     # Add curriculum callback for token progression (unless disabled or resuming)
-    if disable_curriculum or resume_from_checkpoint:
+    if not enable_vision_pooling:
+        logger.info("Curriculum disabled (vision pooling is disabled - all tokens pass through)")
+    elif disable_curriculum or resume_from_checkpoint:
         if resume_from_checkpoint:
             logger.info("Curriculum disabled (resuming from checkpoint - gate should already be trained)")
         else:
             logger.info("Curriculum disabled by flag")
         
-        # Set model to final curriculum state (fully open gate, max K)
+        # Set model to final curriculum state (fully open gate, max K, max cap)
         if hasattr(model, 'base_k'):
             model.base_k = 64  # Final K value
             logger.info(f"Set model.base_k to final value: 64")
+        
+        if hasattr(model, 'max_vision_tokens'):
+            model.max_vision_tokens = 193  # 1 global + 64 pooled + 128 random = 193 total
+            model.allow_extra_tokens = True  # Enable extras
+            logger.info(f"Set model.max_vision_tokens to final value: 193 (1 global + 64 pooled + 128 random)")
         
         if hasattr(model, 'use_soft_gate') and model.use_soft_gate:
             if hasattr(model, 'extra_gate'):
                 with torch.no_grad():
                     model.extra_gate.data.fill_(1.5)  # Final gate value
                 logger.info(f"Set model.extra_gate to final value: 1.5")
-    else:
+    elif enable_vision_pooling:  # Only add curriculum if pooling is enabled
         trainer.add_callback(PercentCurriculum(
-            start_k=16, end_k=64, gate_max=1.5, stage1_pct=0.15, ramp_end_pct=0.50
+            start_k=16, end_k=64, gate_max=1.5,
+            start_cap=64, mid_cap=128, end_cap=193,  # End at 193 for 128 random tokens
+            stage1_pct=0.15, ramp_end_pct=0.50
         ))
         logger.info("Added curriculum callback: Stage 1 (0-15%), Stage 2 ramp (15-50%), Stage 3 (50-100%)")
+        logger.info("Vision token cap will ramp: 64 → 128 → 193 (final: 1 global + 64 pooled + 128 random)")
 
     # 5. Start training with MLflow tracking
     logger.info("Starting Training")
